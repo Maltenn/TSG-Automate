@@ -10,7 +10,7 @@
     {
       "name": "app_updater.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/app_updater.py",
-      "sha256": "637eafb36370b5db8e5198649fb7b392fb33f38d6b26bba918598895fc1a2fa9"
+      "sha256": "04f4e850a948f1dd2a04181478826266a8bfb19ba982d315a9bc1986ec176b08"
     },
     {
       "name": "PDFExtract.py",
