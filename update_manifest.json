@@ -1,0 +1,61 @@
+{
+  "version": "1.0.0",
+  "updated": "2025-03-25",
+  "files": [
+    {
+      "name": "tsg_automate_app.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/tsg_automate_app.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    },
+    {
+      "name": "app_updater.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/app_updater.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    },
+    {
+      "name": "PDFExtract.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PDFExtract.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    },
+    {
+      "name": "BroberryShop.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/BroberryShop.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    },
+    {
+      "name": "BroberryShop_Backorders.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/BroberryShop_Backorders.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    },
+    {
+      "name": "ShoptoPM.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/ShoptoPM.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    },
+    {
+      "name": "Add_PM_Nums.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/Add_PM_Nums.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    },
+    {
+      "name": "PMtoWRG.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoWRG.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    },
+    {
+      "name": "PMtoARIAT.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoARIAT.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    },
+    {
+      "name": "PMtoPropper.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoPropper.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    },
+    {
+      "name": "GetOrderId.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/GetOrderId.py",
+      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+    }
+  ]
+}

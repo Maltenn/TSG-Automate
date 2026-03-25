@@ -1,0 +1,10 @@
+PySide6
+selenium>=4.10
+webdriver-manager
+pdfplumber
+pandas
+openpyxl
+pathlib
+typing
+dataclasses
+pywin32; platform_system == "Windows"
