@@ -5,12 +5,12 @@
     {
       "name": "tsg_automate_app.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/tsg_automate_app.py",
-      "sha256": "f9a5db26e87280760c4a83cee31f35b0aecdb0a1d1b0f9f7494d03b3bf8951b1"
+      "sha256": "9414869e9be87289b91115c8feda73406175152eab4d63c29fd634d5cbde9802"
     },
     {
       "name": "app_updater.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/app_updater.py",
-      "sha256": "04f4e850a948f1dd2a04181478826266a8bfb19ba982d315a9bc1986ec176b08"
+      "sha256": "79d0adcc4db7e765ba6acd37a75696f56c48c3843bc1450c2fbf1a1513e954e3"
     },
     {
       "name": "PDFExtract.py",

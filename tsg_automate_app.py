@@ -904,6 +904,10 @@ class RunningState:
     interactive: ProcWorker | None = None
 
 class MainWindow(QtWidgets.QMainWindow):
+    # Signal used to safely pass update results back to the main thread
+    _update_done = Signal(dict)   # carries update result back to main thread
+    _update_log  = Signal(str)    # carries log messages back to main thread safely
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TSG Automate")
@@ -1149,33 +1153,77 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log("─" * 40)
         self.log("🔄 Starting app update…")
 
+        # Wire up both signals so the background thread can safely
+        # write to the log and return its result to the main thread.
+        # Qt.QueuedConnection ensures delivery happens on the main thread.
+        self._update_log.connect(self.log, QtCore.Qt.QueuedConnection)
+        self._update_done.connect(self._on_update_done, QtCore.Qt.QueuedConnection)
+
         def _do_update():
-            main_app_updated = _app_updater.check_and_update(
+            result = _app_updater.check_and_update(
                 manifest_url=MANIFEST_URL,
                 app_dir=APP_DIR,
-                log=self.log,
-                parent_window=self,
+                log=self._update_log.emit,   # emit through signal, never touch widgets directly
             )
-            if main_app_updated:
-                reply = QtWidgets.QMessageBox.question(
-                    self,
-                    "Restart Required",
-                    "The main application file was updated.\n\n"
-                    "Restart TSG Automate now to apply changes?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                )
-                if reply == QtWidgets.QMessageBox.Yes:
-                    self.log("♻ Restarting…")
-                    QtCore.QTimer.singleShot(
-                        300,
-                        lambda: (
-                            subprocess.Popen([PYTHON_EXE, os.path.join(APP_DIR, "tsg_automate_app.py")]),
-                            QtWidgets.QApplication.quit(),
-                        )
-                    )
-            self.btn_update_app.setEnabled(True)
+            self._update_done.emit(result)
 
         threading.Thread(target=_do_update, daemon=True).start()
+
+    def _on_update_done(self, result: dict):
+        """Called on the main thread once the background worker finishes."""
+        # Disconnect both signals so they don't accumulate if Update is pressed again
+        try:
+            self._update_log.disconnect(self.log)
+        except RuntimeError:
+            pass
+        try:
+            self._update_done.disconnect(self._on_update_done)
+        except RuntimeError:
+            pass
+
+        self.btn_update_app.setEnabled(True)
+
+        if result.get("error"):
+            QtWidgets.QMessageBox.critical(
+                self, "Update Error",
+                f"Could not reach update server:\n\n{result['error']}"
+            )
+            return
+
+        updated = result.get("updated", [])
+        added   = result.get("added", [])
+        failed  = result.get("failed", [])
+        version = result.get("version", "?")
+
+        if not updated and not added:
+            QtWidgets.QMessageBox.information(
+                self, "Already Up-To-Date",
+                f"TSG Automate is already up-to-date.\n(Manifest v{version})"
+            )
+            return
+
+        total = len(updated) + len(added)
+        msg = f"{total} file(s) updated/added successfully."
+        if failed:
+            msg += f"\n\n⚠ {len(failed)} file(s) failed — check the log."
+
+        if result.get("main_app_updated"):
+            msg += "\n\nThe main application file was updated.\nRestart now to apply changes?"
+            reply = QtWidgets.QMessageBox.question(
+                self, "Restart Required", msg,
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if reply == QtWidgets.QMessageBox.Yes:
+                self.log("♻ Restarting…")
+                QtCore.QTimer.singleShot(
+                    300,
+                    lambda: (
+                        subprocess.Popen([PYTHON_EXE, os.path.join(APP_DIR, "tsg_automate_app.py")]),
+                        QtWidgets.QApplication.quit(),
+                    )
+                )
+        else:
+            QtWidgets.QMessageBox.information(self, "Update Complete", msg)
 
     # --- Path helpers (per-profile) ---
     def current_workspace(self) -> str:
