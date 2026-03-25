@@ -1,4 +1,4 @@
-"""
+r"""
 app_updater.py  –  TSG Automate self-updater
 =============================================
 Drop this file into your app folder alongside tsg_automate_app.py.
@@ -18,7 +18,7 @@ HOW IT WORKS
 HOSTING OPTIONS (pick one, set MANIFEST_URL in tsg_automate_app.py)
 --------------------------------------------------------------------
 A) GitHub (recommended – free, versioned, always accessible)
-      MANIFEST_URL = "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/update_manifest.json"
+      MANIFEST_URL = "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/update_manifest.json"
       Upload both the manifest and all script files to that repo.
 
 B) SharePoint / OneDrive direct link
