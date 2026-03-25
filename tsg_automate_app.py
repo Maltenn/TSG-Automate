@@ -300,7 +300,7 @@ PYTHON_EXE = sys.executable
 # Set this to wherever you host the manifest.
 #   GitHub:        "https://raw.githubusercontent.com/ORG/REPO/main/update_manifest.json"
 #   Network share: r"\\server\share\TSG_Automate\update_manifest.json"
-MANIFEST_URL = "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/update_manifest.json"
+MANIFEST_URL = "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/update_manifest.json"
 
 try:
     import app_updater as _app_updater

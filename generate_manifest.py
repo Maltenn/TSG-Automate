@@ -18,7 +18,7 @@ Configuration
 Edit the two variables below:
 
   BASE_URL   – The raw base URL where your files are hosted.
-               For GitHub:  "https://raw.githubusercontent.com/ORG/REPO/main"
+               For GitHub:  "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/update_manifest.json"
                For UNC:     r"\\server\share\TSG_Automate"
 
   FILE_NAMES – List every file you want the updater to manage.

@@ -1,61 +1,56 @@
 {
   "version": "1.0.0",
-  "updated": "2025-03-25",
+  "updated": "2026-03-25",
   "files": [
     {
       "name": "tsg_automate_app.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/tsg_automate_app.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+      "sha256": "f9a5db26e87280760c4a83cee31f35b0aecdb0a1d1b0f9f7494d03b3bf8951b1"
     },
     {
       "name": "app_updater.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/app_updater.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+      "sha256": "637eafb36370b5db8e5198649fb7b392fb33f38d6b26bba918598895fc1a2fa9"
     },
     {
       "name": "PDFExtract.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PDFExtract.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+      "sha256": "96eb9472d73d0f669586625e2459e136709476000cd22f1a1cd5a7e2f06cd27a"
     },
     {
       "name": "BroberryShop.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/BroberryShop.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+      "sha256": "0919aa7b528a941f906ffff506ec1b7f80b91af709e6080348311160812f8422"
     },
     {
       "name": "BroberryShop_Backorders.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/BroberryShop_Backorders.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+      "sha256": "818cd199880de1448ebe034831a4b70b9c913eac66771e9d2da9ae3ab0a3fc3f"
     },
     {
       "name": "ShoptoPM.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/ShoptoPM.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+      "sha256": "8975fbde8079abdd8e63df0a40aabd18d810ce1525707c5c86fc8fb7bdd2ac47"
     },
     {
       "name": "Add_PM_Nums.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/Add_PM_Nums.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+      "sha256": "bc43796fd8e14dd9fe9c1241585a0e57340b3391e062a46fd7438bcda2781ef9"
     },
     {
       "name": "PMtoWRG.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoWRG.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+      "sha256": "654aef5874cbdf65dfb10c3d806082d5f89004b6f26cb8da5ead9daa3207ff41"
     },
     {
       "name": "PMtoARIAT.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoARIAT.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
-    },
-    {
-      "name": "PMtoPropper.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoPropper.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+      "sha256": "65e27d5394e90430c7608982b563f5ceda457856bccb35492688d0cb021e42fb"
     },
     {
       "name": "GetOrderId.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/GetOrderId.py",
-      "sha256": "PLACEHOLDER_run_generate_manifest_py_to_fill_this_in"
+      "sha256": "cd14608c5d135722a37495feeea995af9968f0af82d0569dbadb49aa96f21b5d"
     }
   ]
 }
