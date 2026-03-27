@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "updated": "2026-03-25",
+  "updated": "2026-03-27",
   "files": [
     {
       "name": "tsg_automate_app.py",
@@ -15,12 +15,12 @@
     {
       "name": "PDFExtract.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PDFExtract.py",
-      "sha256": "96eb9472d73d0f669586625e2459e136709476000cd22f1a1cd5a7e2f06cd27a"
+      "sha256": "0a272c96ac18a66d7420a2466cf28f4ec9eaaabfc3ab33218aabd9dea6450fa3"
     },
     {
       "name": "BroberryShop.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/BroberryShop.py",
-      "sha256": "0919aa7b528a941f906ffff506ec1b7f80b91af709e6080348311160812f8422"
+      "sha256": "bba11704eb59e9cd587f9d4cf7678aac8cf2c1ca7cd0c43c884f5295d9c3bfc0"
     },
     {
       "name": "BroberryShop_Backorders.py",
@@ -45,7 +45,12 @@
     {
       "name": "PMtoARIAT.py",
       "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoARIAT.py",
-      "sha256": "65e27d5394e90430c7608982b563f5ceda457856bccb35492688d0cb021e42fb"
+      "sha256": "528411a59ae8e3f99efd449ccc72a30469dbf59d6d08f51f7389ba3ac54ef3d8"
+    },
+    {
+      "name": "PMtoPropper.py",
+      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoPropper.py",
+      "sha256": "8ee6adb15a1de48b4ea65a60b525c977243d026e5b104e8e679cf0aaddd2cbe1"
     },
     {
       "name": "GetOrderId.py",
