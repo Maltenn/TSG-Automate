@@ -4,57 +4,57 @@
   "files": [
     {
       "name": "tsg_automate_app.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/tsg_automate_app.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/tsg_automate_app.py",
       "sha256": "9414869e9be87289b91115c8feda73406175152eab4d63c29fd634d5cbde9802"
     },
     {
       "name": "app_updater.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/app_updater.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/app_updater.py",
       "sha256": "79d0adcc4db7e765ba6acd37a75696f56c48c3843bc1450c2fbf1a1513e954e3"
     },
     {
       "name": "PDFExtract.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PDFExtract.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PDFExtract.py",
       "sha256": "0a272c96ac18a66d7420a2466cf28f4ec9eaaabfc3ab33218aabd9dea6450fa3"
     },
     {
       "name": "BroberryShop.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/BroberryShop.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/BroberryShop.py",
       "sha256": "bba11704eb59e9cd587f9d4cf7678aac8cf2c1ca7cd0c43c884f5295d9c3bfc0"
     },
     {
       "name": "BroberryShop_Backorders.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/BroberryShop_Backorders.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/BroberryShop_Backorders.py",
       "sha256": "818cd199880de1448ebe034831a4b70b9c913eac66771e9d2da9ae3ab0a3fc3f"
     },
     {
       "name": "ShoptoPM.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/ShoptoPM.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/ShoptoPM.py",
       "sha256": "8975fbde8079abdd8e63df0a40aabd18d810ce1525707c5c86fc8fb7bdd2ac47"
     },
     {
       "name": "Add_PM_Nums.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/Add_PM_Nums.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/Add_PM_Nums.py",
       "sha256": "bc43796fd8e14dd9fe9c1241585a0e57340b3391e062a46fd7438bcda2781ef9"
     },
     {
       "name": "PMtoWRG.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoWRG.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoWRG.py",
       "sha256": "654aef5874cbdf65dfb10c3d806082d5f89004b6f26cb8da5ead9daa3207ff41"
     },
     {
       "name": "PMtoARIAT.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoARIAT.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoARIAT.py",
       "sha256": "528411a59ae8e3f99efd449ccc72a30469dbf59d6d08f51f7389ba3ac54ef3d8"
     },
     {
       "name": "PMtoPropper.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/PMtoPropper.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoPropper.py",
       "sha256": "8ee6adb15a1de48b4ea65a60b525c977243d026e5b104e8e679cf0aaddd2cbe1"
     },
     {
       "name": "GetOrderId.py",
-      "url": "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/GetOrderId.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/GetOrderId.py",
       "sha256": "cd14608c5d135722a37495feeea995af9968f0af82d0569dbadb49aa96f21b5d"
     }
   ]
