@@ -632,7 +632,7 @@ def proceed_to_checkout_flow(driver):
             click_button_by_text(driver, "Proceed to Checkout", timeout=WAIT_MED)
         except TimeoutException:
             pass
-
+    time.sleep (1.1)
     WebDriverWait(driver, WAIT_LONG).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, "span.btnDropShip"))
     )
@@ -687,6 +687,56 @@ def handle_address_confirmation_popup(driver, timeout=WAIT_LONG):
         print(f"[WARN] Error handling address confirmation popup: {e}")
 
 
+def _handle_address_validation_warning(driver, timeout: int = 6) -> bool:
+    """
+    After clicking Save on the shipping address form, the site sometimes shows a
+    Dijit validation warning:
+        'We could not find a match for the address entered below.
+         Please double check the fields highlighted in red.
+         If the above address is confirmed, please click Save to continue.'
+
+    When this banner is present the Save button must be clicked a second time to
+    confirm and proceed.  If the banner does not appear within `timeout` seconds
+    we assume the address was accepted on the first click and return False.
+
+    Returns True if the warning was detected and bypassed, False otherwise.
+    """
+    WARNING_CSS = "div.dijitTextBoxError"
+    WARNING_TEXT = "We could not find a match for the address"
+
+    try:
+        # Wait briefly for the warning banner to appear
+        banner = WebDriverWait(driver, timeout).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, WARNING_CSS))
+        )
+        if WARNING_TEXT.lower() not in (banner.text or "").lower():
+            # Different error — don't swallow it; let the caller surface it
+            return False
+
+        print("[WARN] Address validation warning detected — clicking Save again to confirm.")
+        click_dijit_button_by_label(driver, "Save", timeout=WAIT_LONG, prefer_id="dijit_form_Button_40")
+        print("[INFO] Second Save click sent to confirm unmatched address.")
+
+        # Wait for the warning banner to disappear — confirms the form accepted
+        # the second Save and has closed or moved on.
+        try:
+            WebDriverWait(driver, WAIT_MED).until(
+                EC.invisibility_of_element_located((By.CSS_SELECTOR, WARNING_CSS))
+            )
+            print("[INFO] Address validation warning dismissed — form closed successfully.")
+        except TimeoutException:
+            print("[WARN] Warning banner did not disappear after second Save — proceeding anyway.")
+
+        return True
+
+    except TimeoutException:
+        # Banner never appeared — address was accepted first time, nothing to do
+        return False
+    except Exception as e:
+        print(f"[WARN] Unexpected error while handling address validation warning: {e}")
+        return False
+
+
 def fill_drop_ship_address(driver, po_number: str):
     addr = load_shipto_from_po_csv(po_number)
 
@@ -724,10 +774,17 @@ def fill_drop_ship_address(driver, po_number: str):
 
     # ✅ Save (Dijit) - click the actual button node, not just the inner text span
     click_dijit_button_by_label(driver, "Save", timeout=WAIT_LONG, prefer_id="dijit_form_Button_40")
-    
-    # ✅ Handle the address confirmation popup that appears after saving
-    handle_address_confirmation_popup(driver, timeout=WAIT_LONG)
-    
+
+    # ✅ If the site cannot validate the address it shows a dijitTextBoxError warning
+    # and requires a second Save click to confirm and proceed anyway.
+    warning_bypassed = _handle_address_validation_warning(driver)
+
+    # ✅ Handle the address confirmation popup that appears after saving.
+    # When the validation warning was bypassed the React confirmation modal rarely
+    # appears, so use a short timeout (10 s) to avoid a 90-second stall.
+    popup_timeout = WAIT_SHORT if warning_bypassed else WAIT_LONG
+    handle_address_confirmation_popup(driver, timeout=popup_timeout)
+
     return addr
 
 def fill_po_number_field(driver, po_number: str):

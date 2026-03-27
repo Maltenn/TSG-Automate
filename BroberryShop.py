@@ -133,7 +133,7 @@ PRODUCT_MAP = {
     "F52594X250": {
         "url": "https://shop.broberry.com/shop/product/1094476",
         "sizes": [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],
-        "mode": "auto",
+        "mode": "length_grid",
     },
     "10030232": {
         "url": "https://shop.broberry.com/shop/product/1083190",
@@ -152,6 +152,78 @@ PAIRABLE = {
     "10FR13MWZ": "10FR13MMS",
     "10FR13MMS": "10FR13MWZ",
 }
+
+# ─── LENGTH NORMALISATION (F52594X250: Short/Regular/Long/Unhemmed row labels) ──
+LENGTH_ALIASES = {
+    # Short
+    "s": "Short", "sh": "Short", "sht": "Short", "short": "Short",
+    # Regular
+    "r": "Regular", "reg": "Regular", "regular": "Regular", "regl": "Regular",
+    # Long
+    "l": "Long", "lng": "Long", "long": "Long",
+    # Unhemmed
+    "u": "Unhemmed", "unh": "Unhemmed", "unhemmed": "Unhemmed", "unhem": "Unhemmed",
+}
+
+
+def normalize_length(val):
+    """Normalise a length abbreviation → 'Short'/'Regular'/'Long'/'Unhemmed'.
+    Returns None if the value is not a recognised length alias."""
+    if val is None:
+        return None
+    return LENGTH_ALIASES.get(str(val).strip().lower())
+
+
+def resolve_length_grid_dims(size1_raw, size2_raw):
+    """Determine which CSV field is the numeric size and which is the length label
+    for 'length_grid' products (F52594X250).
+
+    Strategy:
+      1. If one field is a plain integer and the other normalises to a length → clear win.
+      2. If only one is an integer → treat as size; attempt to normalise the other as length.
+      3. If only one normalises as a length → treat as length; other assumed to be size.
+      4. Ambiguous (both text, both lengths) → prefer size1 as length, warn.
+
+    Returns (numeric_size: int | None, length_label: str | None).
+    """
+    def _to_int(v):
+        try:
+            return int(str(v).strip())
+        except (ValueError, TypeError):
+            return None
+
+    s1 = str(size1_raw).strip() if size1_raw is not None else ""
+    s2 = str(size2_raw).strip() if size2_raw is not None else ""
+
+    n1, n2 = _to_int(s1), _to_int(s2)
+    l1, l2 = normalize_length(s1), normalize_length(s2)
+
+    # Unambiguous cases
+    if n1 is not None and l2 is not None:
+        return n1, l2        # size1=number, size2=length  ← typical
+    if n2 is not None and l1 is not None:
+        return n2, l1        # size2=number, size1=length  ← reversed
+
+    # One side is numeric, length side unrecognised
+    if n1 is not None:
+        return n1, l2        # l2 may be None; caller will log warning
+    if n2 is not None:
+        return n2, l1
+
+    # Neither is numeric; both text
+    if l1 is not None and l2 is None:
+        return None, l1
+    if l2 is not None and l1 is None:
+        return None, l2
+
+    # Both look like length aliases (e.g. "S", "L") — default: size1=length
+    if l1 is not None:
+        print(f"⚠️  Ambiguous dims for length_grid product "
+              f"(size1={s1!r}, size2={s2!r}). Treating size1 as length.")
+        return None, l1
+
+    return None, None
+
 
 # ─── DRIVER SETUP ───────────────────────────────────────────────────────────────
 def init_driver():
@@ -274,6 +346,26 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
         inseam_i = int(inseam) if inseam is not None and str(inseam).strip() != "" else None
     except Exception:
         inseam_i = None
+    # Raw string form needed for length_grid products (Short/Regular/Long/Unhemmed)
+    inseam_str = str(inseam).strip() if inseam is not None else ""
+
+    # Shared helper: derive the 1-based column index for a given waist/size value
+    # by scanning the table header.  Defined at outer scope so both try_grid and
+    # try_length_grid can call it.
+    def _col_index_for_waist(table, w):
+        w = str(w).strip()
+        xpaths = [
+            f".//thead//tr//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
+            f".//tr[1]//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
+            f".//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
+        ]
+        for xp in xpaths:
+            els = table.find_elements(By.XPATH, xp)
+            if not els:
+                continue
+            el = els[0]
+            return len(el.find_elements(By.XPATH, "preceding-sibling::*[self::th or self::td]")) + 1
+        return None
 
     def try_grid():
         # requires inseam row header + waist list
@@ -287,27 +379,6 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
             By.XPATH,
             f"//td[contains(@class,'sticky') and normalize-space()='{inseam_i}']"
         )
-
-        # New products sometimes shift the waist columns (extra columns, labels, etc.).
-        # Instead of relying on a hard-coded index, derive the waist column from the
-        # table header whenever possible.
-        def _col_index_for_waist(table, w):
-            w = str(w).strip()
-            xpaths = [
-                # Preferred: header area
-                f".//thead//tr//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
-                # Common fallback when there's no <thead>
-                f".//tr[1]//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
-                # Last resort: anywhere in the table (avoid inputs)
-                f".//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
-            ]
-            for xp in xpaths:
-                els = table.find_elements(By.XPATH, xp)
-                if not els:
-                    continue
-                el = els[0]
-                return len(el.find_elements(By.XPATH, "preceding-sibling::*[self::th or self::td]")) + 1
-            return None
 
         # Resolve the target cell by column index
         row = header_td.find_element(By.XPATH, "ancestor::tr[1]")
@@ -341,6 +412,47 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
         qty_input = qty_inputs[0]
         return qty_input, row
 
+    def try_length_grid():
+        """Find the qty input for length_grid products (e.g. F52594X250) whose row
+        labels are text (Short / Regular / Long / Unhemmed) rather than integers."""
+        # inseam holds the normalised length label; waist holds the numeric size.
+        length_label = normalize_length(inseam_str) or inseam_str
+        if not length_label or waist_i is None:
+            return None
+
+        try:
+            header_td = driver.find_element(
+                By.XPATH,
+                f"//td[contains(@class,'sticky') and normalize-space()='{length_label}']"
+            )
+        except NoSuchElementException:
+            return None
+
+        row   = header_td.find_element(By.XPATH, "ancestor::tr[1]")
+        table = header_td.find_element(By.XPATH, "ancestor::table[1]")
+        col_idx = _col_index_for_waist(table, waist_i)
+
+        if col_idx is None and sizes:
+            try:
+                col_idx = sizes.index(waist_i) + 2  # +1 sticky label + 1-based
+            except ValueError:
+                return None
+
+        if col_idx is None:
+            return None
+
+        row_cells = row.find_elements(By.XPATH, "./*[self::td or self::th]")
+        if col_idx < 1 or col_idx > len(row_cells):
+            return None
+
+        cell   = row_cells[col_idx - 1]
+        inputs = cell.find_elements(By.CSS_SELECTOR, "input[type='number']")
+        if inputs:
+            return inputs[0], cell
+        raise UnorderableSizeError(
+            f"{sku} size {waist_i} {length_label} is not orderable (no qty input)"
+        )
+
     if mode == "grid":
         try:
             return try_grid()
@@ -349,6 +461,13 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
     if mode == "row":
         try:
             return try_row()
+        except Exception:
+            return None
+    if mode == "length_grid":
+        try:
+            return try_length_grid()
+        except UnorderableSizeError:
+            raise
         except Exception:
             return None
 
@@ -674,9 +793,22 @@ def process_csv(driver, csv_path):
         waist_v  = row.get("Size-1", "")
         inseam_v = row.get("Size-2", "")
 
-        # Some products are single-dimension (waist only). Allow blank/NA inseam.
-        waist  = int(waist_v) if str(waist_v).strip() != "" and str(waist_v).lower() != "nan" else None
-        inseam = int(inseam_v) if str(inseam_v).strip() != "" and str(inseam_v).lower() != "nan" else None
+        # length_grid products (F52594X250): one dim is a text label (Short/Regular/Long/Unhemmed)
+        # and the other is the numeric size 2-24.  Resolve which is which automatically.
+        if PRODUCT_MAP.get(sku, {}).get("mode") == "length_grid":
+            waist, inseam = resolve_length_grid_dims(waist_v, inseam_v)
+            if inseam is None:
+                print(f"⚠️  Could not determine length for {sku} "
+                      f"(size1={waist_v!r}, size2={inseam_v!r}). Skipping line.")
+                continue
+            if waist is None:
+                print(f"⚠️  Could not determine numeric size for {sku} "
+                      f"(size1={waist_v!r}, size2={inseam_v!r}). Skipping line.")
+                continue
+        else:
+            # Standard products: size1=waist (int), size2=inseam (int or blank)
+            waist  = int(waist_v)  if str(waist_v).strip()  != "" and str(waist_v).lower()  != "nan" else None
+            inseam = int(inseam_v) if str(inseam_v).strip() != "" and str(inseam_v).lower() != "nan" else None
         qty_v  = row.get("Qty", 0)
         qty    = int(qty_v) if str(qty_v).strip() != "" and str(qty_v).lower() != "nan" else 0
 

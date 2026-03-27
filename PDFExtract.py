@@ -518,14 +518,20 @@ def find_sizes(main_line: str, cont_lines, pid=""):
     if m:
         return [m.group(1), m.group(2)]
 
+    # "- 14 L" style: numeric size (any width) + alpha inseam/length (e.g. women's sizes)
+    m = re.search(r"-\s*(\d{1,3})\s+([A-Z]{1,4})\b", text, re.I)
+    if m and m.group(2).upper() in ALPHA_SIZES:
+        return [m.group(1), m.group(2).upper()]
+
     # Integer tokens not adjacent to '.' so we don't split decimals like 40.28 into 40 and 28
     nums = re.findall(r"(?<![\d.])\d{2,3}(?![\d.])", text)
     nums = [n for n in nums if 20 <= int(n) <= 60]
     if nums:
         return nums[-2:] if len(nums) >= 2 else [nums[-1]]
 
-    # Alpha size tokens
-    toks = re.findall(r"\b[A-Z]{1,4}\b", text.upper())
+    # Alpha size tokens — use (?<!') to avoid matching letters split from apostrophes
+    # e.g. "Women's" → "WOMEN'S" would otherwise yield a spurious "S" token
+    toks = re.findall(r"(?<!')\b[A-Z]{1,4}\b", text.upper())
     sizes = []
     seen = set()
     for t in toks:
