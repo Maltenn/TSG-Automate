@@ -1,11 +1,11 @@
 {
   "version": "1.0.0",
-  "updated": "2026-03-27",
+  "updated": "2026-04-10",
   "files": [
     {
       "name": "tsg_automate_app.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/tsg_automate_app.py",
-      "sha256": "9414869e9be87289b91115c8feda73406175152eab4d63c29fd634d5cbde9802"
+      "sha256": "d70a5c7c3ffd7ca9a48522ede2c5f57ef4cd134cb9b8bd7c7c35b27ebea7a6e9"
     },
     {
       "name": "app_updater.py",
@@ -40,17 +40,17 @@
     {
       "name": "PMtoWRG.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoWRG.py",
-      "sha256": "654aef5874cbdf65dfb10c3d806082d5f89004b6f26cb8da5ead9daa3207ff41"
+      "sha256": "927c5a7d739170878dd941966deaee2ba40c5519ba42dd4368550acc6124f9c8"
     },
     {
       "name": "PMtoARIAT.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoARIAT.py",
-      "sha256": "528411a59ae8e3f99efd449ccc72a30469dbf59d6d08f51f7389ba3ac54ef3d8"
+      "sha256": "64dc80c03a81847a9881ce38122ae0174bafa8b07d3c2bbf9cfec3a41594ec7f"
     },
     {
       "name": "PMtoPropper.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoPropper.py",
-      "sha256": "8ee6adb15a1de48b4ea65a60b525c977243d026e5b104e8e679cf0aaddd2cbe1"
+      "sha256": "45b60cd6d33aaf39e969e9c15a55d6abe318cece1a43f3801e6c3545b9a54f8a"
     },
     {
       "name": "GetOrderId.py",

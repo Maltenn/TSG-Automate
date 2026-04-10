@@ -1243,14 +1243,18 @@ def main():
         col_g = df.columns[6]   # draft-name / PO column
         col_d = df.columns[3]   # Client PO # (used to locate PDFs_DIR\\<Client PO #>.csv)
         col_j = df.columns[9]   # the raw order field
+        col_k = df.columns[10]  # brand column – only process rows containing "Wrangler"
+
+        # Filter to only rows where column K contains "Wrangler" (case-insensitive)
+        df = df[df[col_k].fillna("").str.contains("Wrangler", case=False, na=False)].reset_index(drop=True)
 
         # track which row/index and PO we processed
         processed = []
-        
+
         total_orders = len(df)
         log("")
         log("="*60)
-        log(f"[INFO] Starting Order Placement - {total_orders} orders to process")
+        log(f"[INFO] Starting Order Placement - {total_orders} Wrangler orders to process")
         log("="*60)
 
         # Place all orders
@@ -1275,7 +1279,7 @@ def main():
             upload_batch_order(driver, order_no)
             checkout_and_ship(driver, draft_name, client_po)
 
-            processed.append((idx, draft_name))
+            processed.append((idx, draft_name, client_po))
             log(f"[OK] Order {draft_name} placed successfully!")
             
             # Small pause between orders to let system settle

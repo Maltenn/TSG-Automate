@@ -28,7 +28,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal, QDir
 
 # =============================================================================
@@ -918,6 +918,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_active = False
         self.active_workers = []
 
+        # ── Hidden dev menu (Ctrl+Shift+D) ──────────────────────────────────
+        self._init_dev_menu()
+
         # ── Central widget ──────────────────────────────────────────────────
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -975,9 +978,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_wrg      = self._btn("📦  Place Orders with Vendor", "step")
         self.btn_wrg_only   = self._btn("🤠  Place with Wrangler",    "step")
         self.btn_ariat_only = self._btn("👢  Place with Ariat",       "step")
-        self.btn_submit_ariat = self._btn("🚀  Submit Ariat Order",   "verify")
-        self.btn_submit_ariat.setEnabled(False)
-        self.btn_submit_ariat.setToolTip("Send Enter to PMtoARIAT.py — confirms the cart and submits the current order")
+        self.btn_finalize_vendor = self._btn("🚀  Finalize With Vendor",   "verify")
+        self.btn_finalize_vendor.setEnabled(False)
+        self.btn_finalize_vendor.setToolTip("Review the order in the browser, then click to submit it")
         self.btn_propper_only = self._btn("🪖  Place with Propper",   "step")
         self.btn_wrg_only.setToolTip("Run PMtoWRG.py directly")
         self.btn_ariat_only.setToolTip("Run PMtoARIAT.py directly")
@@ -992,7 +995,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for btn in (self.btn_extract, self.btn_broberry, self.btn_download,
                     self.btn_pad, self.btn_wrg,
-                    self.btn_wrg_only, self.btn_ariat_only, self.btn_submit_ariat,
+                    self.btn_wrg_only, self.btn_ariat_only, self.btn_finalize_vendor,
                     self.btn_propper_only,
                     self.btn_get_order_ids, self.btn_backorders, self.btn_verify):
             steps_layout.addWidget(btn)
@@ -1087,7 +1090,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_wrg.clicked.connect(self.run_orders_with_vendor)
         self.btn_wrg_only.clicked.connect(self.run_pm_to_wrg)
         self.btn_ariat_only.clicked.connect(self.run_pm_to_ariat)
-        self.btn_submit_ariat.clicked.connect(self.submit_ariat_order)
+        self.btn_finalize_vendor.clicked.connect(self.finalize_vendor_order)
         self.btn_propper_only.clicked.connect(self.run_pm_to_propper)
         self.btn_get_order_ids.clicked.connect(self.run_get_order_ids)
         self.btn_backorders.clicked.connect(self.run_backorders_then_pm)
@@ -1251,6 +1254,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "PMtoPropper.py": os.path.join(ws, "PMtoPropper.py"),
                 "GetOrderId.py": os.path.join(ws, "GetOrderId.py"),
                 "BroberryShop_Backorders.py": os.path.join(ws, "BroberryShop_Backorders.py"),
+                "generate_manifest.py": os.path.join(ws, "generate_manifest.py"),
             }
         }
 
@@ -1264,7 +1268,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def log(self, msg: str):
         self.log_box.appendPlainText(msg)
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
-        print(msg)
+        try:
+            print(msg)
+        except UnicodeEncodeError:
+            print(msg.encode("ascii", "replace").decode("ascii"))
 
     # --- File ops ---
     def open_pdfs_folder(self):
@@ -1355,7 +1362,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if worker is self.running.pm_to_wrg:
                 self.btn_verify.setEnabled(False)
                 self.running.pm_to_wrg = None
-                purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
             try:
                 self.active_workers.remove(worker)
             except ValueError:
@@ -1441,22 +1447,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.running.pm_to_ariat = worker
             self.running.interactive = worker
             self.btn_verify.setEnabled(True)
-            self.btn_submit_ariat.setEnabled(True)
-            self.log("👢 Ariat running — review the cart in the browser, then click Submit Ariat Order to place it.")
+            self.btn_finalize_vendor.setEnabled(True)
+            self.log('👢 Ariat running — review the cart in the browser, then click "Finalize With Vendor" to place it.')
 
             def _ariat_done(rc):
-                self.btn_submit_ariat.setEnabled(False)
+                self.btn_finalize_vendor.setEnabled(False)
             worker.finished.connect(_ariat_done)
         return worker
 
-    def submit_ariat_order(self):
-        """Send Enter to the running PMtoARIAT.py process to confirm and submit the current order."""
+    def finalize_vendor_order(self):
+        """Send Enter to the running Ariat or Propper script to confirm and submit the current order."""
+        # Try Ariat first, then Propper
         w = getattr(self.running, "pm_to_ariat", None)
+        label = "Ariat"
         if w is None or not w.is_running():
-            self.log("[INFO] No Ariat script is currently waiting.")
+            w = getattr(self.running, "pm_to_propper", None)
+            label = "Propper"
+        if w is None or not w.is_running():
+            self.log("[INFO] No vendor script is currently waiting for finalization.")
             return
         w.send_enter()
-        self.log("🚀 Sent submit signal to Ariat — order submission in progress...")
+        self.log(f"🚀 Sent submit signal to {label} — order submission in progress...")
 
 
     def run_pm_to_propper(self):
@@ -1468,21 +1479,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self.running.pm_to_propper = worker
             self.running.interactive = worker
             self.btn_verify.setEnabled(True)
-            self.log('\U0001f9e9 Propper will pause for manual submit; press "Verification Complete \u2705" to continue when prompted.')
+            self.btn_finalize_vendor.setEnabled(True)
+            self.log('🪖 Propper running — review the cart in the browser, then click "Finalize With Vendor" to place it.')
+
+            def _propper_done(rc):
+                self.btn_finalize_vendor.setEnabled(False)
+            worker.finished.connect(_propper_done)
         return worker
 
     def run_orders_with_vendor(self, on_complete=None):
         """
         Reads Processed_orders.xlsx and routes orders based on Column K (vendor).
-        - Wrangler rows -> PMtoWRG.py
-        - Ariat/Carhartt rows -> PMtoARIAT.py
+        - Wrangler rows  -> PMtoWRG.py
+        - Ariat/Carhartt -> PMtoARIAT.py
+        - Propper        -> PMtoPropper.py
 
-        Implementation detail:
-        We temporarily overwrite Processed_orders.xlsx with a filtered subset for each vendor script,
-        then restore the full workbook afterwards.
+        Each vendor script reads the FULL Excel and self-filters by Column K,
+        so we no longer overwrite the file with subsets.
         """
         try:
-            from openpyxl import load_workbook, Workbook
+            from openpyxl import load_workbook
         except Exception as e:
             self.log(f"[ERROR] openpyxl not installed: {e}")
             if on_complete:
@@ -1511,8 +1527,6 @@ class MainWindow(QtWidgets.QMainWindow):
         max_row = ws.max_row
         max_col = ws.max_column
 
-        header = [ws.cell(row=1, column=c).value for c in range(1, max_col + 1)]
-
         VENDOR_COL = 11  # Column K
         if max_col < VENDOR_COL:
             self.log("[ERROR] Processed_orders.xlsx does not have Column K (vendor).")
@@ -1520,98 +1534,51 @@ class MainWindow(QtWidgets.QMainWindow):
                 on_complete(1)
             return None
 
-        def classify_vendor(raw: str) -> str:
-            s = (raw or "").strip().lower()
-            primary = re.split(r"[,/;|]+", s)[0].strip() if s else ""
-            targets = [primary, s]
-
-            def is_wrg(x):
-                return ("wrangler" in x) or (x == "wrg") or (" wrg" in x) or ("wrg " in x)
-
-            def is_ariat(x):
-                return ("ariat" in x) or ("carhartt" in x)
-
-            for x in targets:
-                if is_wrg(x):
-                    return "wrangler"
-                if is_ariat(x):
-                    return "ariat"
-            return ""
-
-        wrg_rows = []
-        ariat_rows = []
+        # Scan Column K to decide which vendor scripts need to run.
+        has_wrg = False
+        has_ariat = False
+        has_propper = False
 
         for r in range(2, max_row + 1):
             vend_val = ws.cell(row=r, column=VENDOR_COL).value
-            vend = classify_vendor(str(vend_val) if vend_val is not None else "")
-            row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
-            if vend == "wrangler":
-                wrg_rows.append(row_vals)
-            elif vend == "ariat":
-                ariat_rows.append(row_vals)
+            s = (str(vend_val) if vend_val is not None else "").strip().lower()
+            if ("wrangler" in s) or (s == "wrg") or (" wrg" in s) or ("wrg " in s):
+                has_wrg = True
+            if ("ariat" in s) or ("carhartt" in s):
+                has_ariat = True
+            if "propper" in s:
+                has_propper = True
 
-        if not wrg_rows and not ariat_rows:
-            self.log("[INFO] No Wrangler or Ariat rows found in Column K. Nothing to run.")
+        wb.close()
+
+        if not has_wrg and not has_ariat and not has_propper:
+            self.log("[INFO] No Wrangler, Ariat, or Propper rows found in Column K. Nothing to run.")
             if on_complete:
                 on_complete(0)
             return None
 
+        # Build the list of vendor scripts to run sequentially.
+        # Each script reads the full Excel and filters by its own vendor.
         steps = []
-        if wrg_rows:
-            steps.append(("Wrangler", "PMtoWRG.py", wrg_rows))
-        if ariat_rows:
-            steps.append(("Ariat", "PMtoARIAT.py", ariat_rows))
-
-        backup_path = processed_path + ".FULL.bak"
-        try:
-            import shutil
-            shutil.copy2(processed_path, backup_path)
-        except Exception as e:
-            self.log(f"[ERROR] Could not backup Processed_orders.xlsx: {e}")
-            if on_complete:
-                on_complete(1)
-            return None
-
-        def write_subset(rows):
-            sub = Workbook()
-            sws = sub.active
-            sws.title = ws.title if ws.title else "Sheet1"
-            for c, val in enumerate(header, start=1):
-                sws.cell(row=1, column=c, value=val)
-            for rr, row_vals in enumerate(rows, start=2):
-                for c, val in enumerate(row_vals, start=1):
-                    sws.cell(row=rr, column=c, value=val)
-            sub.save(processed_path)
-
-        def restore_full():
-            try:
-                import shutil
-                shutil.copy2(backup_path, processed_path)
-                os.remove(backup_path)
-            except Exception as e:
-                self.log(f"[WARN] Could not restore full Processed_orders.xlsx automatically: {e}")
+        if has_wrg:
+            steps.append(("Wrangler", "PMtoWRG.py"))
+        if has_ariat:
+            steps.append(("Ariat", "PMtoARIAT.py"))
+        if has_propper:
+            steps.append(("Propper", "PMtoPropper.py"))
 
         def run_step(i: int):
             if i >= len(steps):
-                restore_full()
                 self.btn_verify.setEnabled(False)
+                self.btn_finalize_vendor.setEnabled(False)
                 self.running.interactive = None
                 self.log("◆ Place Orders with Vendor complete.")
                 if on_complete:
                     on_complete(0)
                 return
 
-            vendor_name, script_name, rows = steps[i]
-            self.log(f"▶ Starting {vendor_name}… ({len(rows)} row(s))")
-
-            try:
-                write_subset(rows)
-            except Exception as e:
-                self.log(f"[ERROR] Failed writing vendor subset for {vendor_name}: {e}")
-                restore_full()
-                if on_complete:
-                    on_complete(1)
-                return
+            vendor_name, script_name = steps[i]
+            self.log(f"▶ Starting {vendor_name}…")
 
             worker = self.run_script(script_name, stdin_pipe=True, label=f"{script_name} ({vendor_name})")
             if worker is None:
@@ -1626,10 +1593,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.running.pm_to_wrg = worker
             elif script_name == "PMtoARIAT.py":
                 self.running.pm_to_ariat = worker
+                self.btn_finalize_vendor.setEnabled(True)
+            elif script_name == "PMtoPropper.py":
+                self.running.pm_to_propper = worker
+                self.btn_finalize_vendor.setEnabled(True)
 
             def _after(rc):
                 self.running.interactive = None
                 self.btn_verify.setEnabled(False)
+                self.btn_finalize_vendor.setEnabled(False)
                 self.log(f"◆ {vendor_name} exited with code {rc}")
                 run_step(i + 1)
 
@@ -1736,6 +1708,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ensure_processed_orders_closed_path(self.paths()["processed"], self.log)
         self.log("▶ Run All Steps starting…")
 
+        # Purge leftover PDFs/CSVs from the previous run before creating new ones.
+        purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
+
         def halt_pipeline(step_name: str, rc: int):
             self.pipeline_active = False
             self.log(f"[ERROR] {step_name} failed with exit code {rc}.")
@@ -1816,6 +1791,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ensure_processed_orders_closed_path(self.paths()["processed"], self.log)
         self.log("▶ Run to PM (manual) starting…")
 
+        # Purge leftover PDFs/CSVs from the previous run before creating new ones.
+        purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
+
         def halt_pipeline(step_name: str, rc: int):
             self.pipeline_active = False
             self.log(f"[ERROR] {step_name} failed with exit code {rc}.")
@@ -1865,6 +1843,24 @@ class MainWindow(QtWidgets.QMainWindow):
     # --- Clear PDF folder ---
     def clear_pdf_folder(self):
         purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
+
+    # --- Hidden dev menu (Ctrl+Shift+D) ---
+    def _init_dev_menu(self):
+        """Create a hidden Dev menu accessible only via Ctrl+Shift+D."""
+        dev_menu = self.menuBar().addMenu("Dev")
+        dev_menu.menuAction().setVisible(False)  # hide from menu bar
+
+        gen_manifest = dev_menu.addAction("Generate Manifest")
+        gen_manifest.triggered.connect(self.run_generate_manifest)
+
+        shortcut = QtGui.QShortcut(QtCore.QKeyCombination(
+            Qt.ControlModifier | Qt.ShiftModifier, Qt.Key_D
+        ), self)
+        shortcut.activated.connect(lambda: dev_menu.exec(self.mapToGlobal(QtCore.QPoint(10, 30))))
+
+    def run_generate_manifest(self):
+        self.log("▶ Running generate_manifest.py…")
+        self.run_script("generate_manifest.py", label="generate_manifest.py")
 
     # --- Graceful shutdown ---
     def closeEvent(self, event):

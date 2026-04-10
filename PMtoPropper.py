@@ -105,6 +105,46 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def cleanup_po_files(client_po: str) -> None:
+    """Delete the CSV and PDF in PDFS_DIR that belong to a just-placed order.
+
+    CSV pattern : <PDFS_DIR>/<client_po>.csv
+    PDF pattern : <PDFS_DIR>/PO_Form_Group<client_po>*.pdf
+    """
+    deleted, skipped = [], []
+
+    # CSV
+    csv_target = os.path.join(PDFS_DIR, f"{client_po}.csv")
+    if os.path.exists(csv_target):
+        try:
+            os.remove(csv_target)
+            deleted.append(csv_target)
+            log(f"[INFO] Deleted CSV: {csv_target}")
+        except Exception as e:
+            log(f"[WARN] Could not delete CSV '{csv_target}': {e}")
+            skipped.append(csv_target)
+    else:
+        log(f"[INFO] CSV not found (already removed?): {csv_target}")
+
+    # PDF (vendor name varies, so use a wildcard)
+    pdf_matches = glob.glob(os.path.join(PDFS_DIR, f"PO_Form_Group{client_po}*.pdf"))
+    if not pdf_matches:
+        pdf_matches = glob.glob(os.path.join(PDFS_DIR, f"PO_Form_Group{client_po}*.PDF"))
+    if pdf_matches:
+        for pdf_path in pdf_matches:
+            try:
+                os.remove(pdf_path)
+                deleted.append(pdf_path)
+                log(f"[INFO] Deleted PDF: {pdf_path}")
+            except Exception as e:
+                log(f"[WARN] Could not delete PDF '{pdf_path}': {e}")
+                skipped.append(pdf_path)
+    else:
+        log(f"[INFO] PDF not found for client PO {client_po} (already removed?)")
+
+    log(f"[INFO] Cleanup for PO {client_po}: {len(deleted)} deleted, {len(skipped)} skipped.")
+
+
 def coerce_str(val) -> str:
     """Convert any pandas/Excel value to a clean string."""
     if val is None:
@@ -432,7 +472,7 @@ def _wait_for_address_form(driver, timeout: int = WAIT_XLONG) -> None:
     )
 
 
-def fill_shipping_address(driver, addr: dict) -> None:
+def fill_shipping_address(driver, addr: dict, client_po: str = "") -> None:
     """Click New Address, wait for the modal, fill all fields, click Ship Here."""
     wait = WebDriverWait(driver, WAIT_LONG)
 
@@ -490,8 +530,11 @@ def fill_shipping_address(driver, addr: dict) -> None:
     _ko_set_value(driver, fn_el, company_val)
     log(f"[INFO] firstname (Company): {company_val}")
 
-    # ── Last name → Attention ─────────────────────────────────────────────────
+    # ── Last name → Attention (fall back to Client PO if blank) ────────────
     attention_val = addr.get("attention", "")
+    if not attention_val.strip():
+        attention_val = client_po
+        log(f"[INFO] Attention is blank — using Client PO as lastname: {attention_val}")
     ln_el = get_field("lastname")
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", ln_el)
     _ko_set_value(driver, ln_el, attention_val)
@@ -707,15 +750,17 @@ def fill_shipping_method_and_next(driver) -> None:
         # Wait a moment then check if we moved past the shipping step
         time.sleep(3)
 
-        # If the carrier dropdown is still visible, an error occurred and we
+        # If the carrier dropdown is still *visible*, an error occurred and we
         # were kicked back.  Loop and retry.
+        # NOTE: use visibility check, not presence — Magento keeps previous
+        # step elements in the DOM even after advancing.
         try:
             WebDriverWait(driver, 4).until(
-                EC.presence_of_element_located((By.ID, "shippingnumber"))
+                EC.visibility_of_element_located((By.ID, "shippingnumber"))
             )
             log("[WARN] Still on shipping step after clicking Next — retrying (error popup?).")
         except TimeoutException:
-            # Carrier dropdown gone → we advanced to the next step
+            # Carrier dropdown not visible → we advanced to the next step
             log("[OK] Moved past shipping step.")
             return
 
@@ -741,19 +786,19 @@ def fill_payment(driver, po_number: str) -> None:
     log(f"[INFO] Entering PO number: '{po_text}'")
 
     po_input = wait.until(
-        EC.presence_of_element_located(
+        EC.visibility_of_element_located(
             (By.CSS_SELECTOR,
-             "input[name='payment[po_number]'], "
-             "input[id*='po_number'], "
-             "input[id*='purchaseorder']")
+             "input#po_number, "
+             "input[name='payment[po_number]']")
         )
     )
     clear_and_type(driver, po_input, po_text)
     log(f"[OK] PO number entered: '{po_text}'")
 
 
-def place_order(driver) -> None:
-    """Click the Place Order button and wait for the confirmation page."""
+def place_order(driver) -> str:
+    """Click the Place Order button, wait for the confirmation page,
+    and return the order number (or empty string if not found)."""
     wait = WebDriverWait(driver, WAIT_LONG)
     log("[INFO] Clicking Place Order...")
     place_btn = wait.until(
@@ -768,6 +813,50 @@ def place_order(driver) -> None:
     safe_click(driver, place_btn)
     log("[OK] Place Order clicked — waiting for confirmation...")
     time.sleep(5)
+
+    # Extract order number from the confirmation page
+    order_id = ""
+    try:
+        order_link = WebDriverWait(driver, WAIT_LONG).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "a.order-number strong")
+            )
+        )
+        order_id = order_link.text.strip()
+        log(f"[OK] Propper order number: {order_id}")
+    except TimeoutException:
+        log("[WARN] Could not extract order number from confirmation page.")
+    return order_id
+
+
+def update_order_id_in_excel(excel_path: str, row_index: int, order_id: str) -> bool:
+    """Write the vendor order ID into column M (index 12) of the Excel file.
+    If the cell already has a value, append with ', ' as separator."""
+    try:
+        log(f"[INFO] Updating Excel with Order ID: {order_id}")
+        df = pd.read_excel(excel_path, engine="openpyxl", dtype=str)
+
+        # Ensure column M exists
+        while len(df.columns) < 13:
+            df.insert(len(df.columns), f"Column_{len(df.columns)}", "")
+
+        col_m = df.columns[12]
+        existing = coerce_str(df.at[row_index, col_m])
+
+        if existing:
+            new_val = f"{existing}, {order_id}"
+            log(f"[INFO] Appending: '{existing}' → '{new_val}'")
+        else:
+            new_val = order_id
+            log(f"[INFO] Setting Order ID: '{new_val}'")
+
+        df.at[row_index, col_m] = new_val
+        df.to_excel(excel_path, index=False)
+        log(f"[OK] Excel updated: {excel_path}")
+        return True
+    except Exception as e:
+        log(f"[ERROR] Failed to update Excel: {e}")
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -891,7 +980,7 @@ def main():
             proceed_to_checkout(driver)
 
             # ── Step 3: Fill shipping address ─────────────────────────────────
-            fill_shipping_address(driver, addr)
+            fill_shipping_address(driver, addr, client_po=client_po)
 
             # ── Step 4: Select FedEx Ground + account number + Next ───────────
             fill_shipping_method_and_next(driver)
@@ -916,8 +1005,11 @@ def main():
             log("[INFO] User confirmed — placing order...")
 
             # ── Step 7: Place Order ───────────────────────────────────────────
-            place_order(driver)
+            order_id = place_order(driver)
             log(f"[OK] Order placed for PO '{po_number}'!")
+
+            if order_id:
+                update_order_id_in_excel(EXCEL_PATH, idx, order_id)
 
             # Short pause between orders so the site can settle
             if order_num < total:

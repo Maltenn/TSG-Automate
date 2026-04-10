@@ -11,6 +11,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
+from selenium.webdriver.common.action_chains import ActionChains
 
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
@@ -53,6 +54,48 @@ def coerce_str(val) -> str:
             return str(int(val))
         return str(val)
     return str(val).strip()
+
+
+def cleanup_po_files(client_po: str, csv_path: str = "") -> None:
+    """Delete the CSV and PDF in PDF_DIR that belong to a just-placed order.
+
+    CSV: uses csv_path directly if provided, otherwise falls back to
+         <PDF_DIR>/<client_po>.csv
+    PDF pattern: <PDF_DIR>/PO_Form_Group<client_po>*.pdf
+    """
+    deleted, skipped = [], []
+
+    # CSV — prefer the exact path we already know
+    csv_target = csv_path if csv_path and os.path.exists(csv_path) \
+                 else os.path.join(PDF_DIR, f"{client_po}.csv")
+    if os.path.exists(csv_target):
+        try:
+            os.remove(csv_target)
+            deleted.append(csv_target)
+            print(f"[INFO] Deleted CSV: {csv_target}")
+        except Exception as e:
+            print(f"[WARN] Could not delete CSV '{csv_target}': {e}")
+            skipped.append(csv_target)
+    else:
+        print(f"[INFO] CSV not found (already removed?): {csv_target}")
+
+    # PDF (vendor name varies, so use a wildcard)
+    pdf_matches = glob.glob(os.path.join(PDF_DIR, f"PO_Form_Group{client_po}*.pdf"))
+    if not pdf_matches:
+        pdf_matches = glob.glob(os.path.join(PDF_DIR, f"PO_Form_Group{client_po}*.PDF"))
+    if pdf_matches:
+        for pdf_path in pdf_matches:
+            try:
+                os.remove(pdf_path)
+                deleted.append(pdf_path)
+                print(f"[INFO] Deleted PDF: {pdf_path}")
+            except Exception as e:
+                print(f"[WARN] Could not delete PDF '{pdf_path}': {e}")
+                skipped.append(pdf_path)
+    else:
+        print(f"[INFO] PDF not found for client PO {client_po} (already removed?)")
+
+    print(f"[INFO] Cleanup for PO {client_po}: {len(deleted)} deleted, {len(skipped)} skipped.")
 
 
 def extract_po_key(po_number: str) -> str:
@@ -162,6 +205,16 @@ def is_main_menu_open(driver) -> bool:
 
 
 def open_main_menu(driver, timeout=WAIT_LONG):
+    """
+    Opens the Dojo hover/click main menu.  Tries multiple strategies in order:
+      1. ActionChains hover over the outer wrapper div (correct for hover menus)
+      2. ActionChains hover over the inner role=button span (dijit_form_Button_6)
+      3. JS click on the inner role=button span
+      4. JS click on the outer wrapper div
+      5. aria-owns CSS selector fallback click
+    Each strategy waits up to 6 s for the popup to become visible before
+    retrying the whole loop.
+    """
     end = time.time() + timeout
     last_err = None
 
@@ -169,31 +222,78 @@ def open_main_menu(driver, timeout=WAIT_LONG):
         if is_main_menu_open(driver):
             return
 
-        try:
-            trigger = WebDriverWait(driver, 6).until(
-                EC.element_to_be_clickable((By.ID, MAIN_MENU_TRIGGER_ID))
-            )
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", trigger)
-            safe_click(driver, trigger)
-        except Exception as e:
-            last_err = e
-            try:
-                trigger2 = WebDriverWait(driver, 4).until(
-                    EC.element_to_be_clickable((
-                        By.CSS_SELECTOR,
-                        f"*[aria-owns='{MAIN_MENU_POPUP_ID}'], *[aria-controls='{MAIN_MENU_POPUP_ID}']"
-                    ))
-                )
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", trigger2)
-                safe_click(driver, trigger2)
-            except Exception as e2:
-                last_err = e2
+        # ── Resolve trigger elements ──────────────────────────────────────────
+        trigger_outer = None
+        trigger_inner = None   # the actual role=button span inside the wrapper
 
         try:
+            trigger_outer = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.ID, MAIN_MENU_TRIGGER_ID))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", trigger_outer)
+        except Exception as e:
+            last_err = e
+
+        if trigger_outer is not None:
+            try:
+                # The visible "Menu" button is the first role=button span inside the wrapper
+                trigger_inner = trigger_outer.find_element(
+                    By.CSS_SELECTOR, "span[role='button']"
+                )
+            except Exception:
+                trigger_inner = trigger_outer
+
+        # ── Strategy 1: hover outer wrapper (standard Dojo hover menu) ────────
+        if trigger_outer is not None:
+            try:
+                ActionChains(driver).move_to_element(trigger_outer).perform()
+                WebDriverWait(driver, 6).until(lambda d: is_main_menu_open(d))
+                return
+            except Exception as e:
+                last_err = e
+
+        # ── Strategy 2: hover inner role=button span ──────────────────────────
+        if trigger_inner is not None:
+            try:
+                ActionChains(driver).move_to_element(trigger_inner).perform()
+                WebDriverWait(driver, 6).until(lambda d: is_main_menu_open(d))
+                return
+            except Exception as e:
+                last_err = e
+
+        # ── Strategy 3: JS click inner button span ────────────────────────────
+        if trigger_inner is not None:
+            try:
+                driver.execute_script("arguments[0].click();", trigger_inner)
+                WebDriverWait(driver, 6).until(lambda d: is_main_menu_open(d))
+                return
+            except Exception as e:
+                last_err = e
+
+        # ── Strategy 4: JS click outer wrapper ───────────────────────────────
+        if trigger_outer is not None:
+            try:
+                driver.execute_script("arguments[0].click();", trigger_outer)
+                WebDriverWait(driver, 6).until(lambda d: is_main_menu_open(d))
+                return
+            except Exception as e:
+                last_err = e
+
+        # ── Strategy 5: aria-owns CSS selector ───────────────────────────────
+        try:
+            trigger_css = WebDriverWait(driver, 4).until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    f"*[aria-owns='{MAIN_MENU_POPUP_ID}'], *[aria-controls='{MAIN_MENU_POPUP_ID}']"
+                ))
+            )
+            ActionChains(driver).move_to_element(trigger_css).perform()
             WebDriverWait(driver, 6).until(lambda d: is_main_menu_open(d))
             return
-        except Exception:
-            time.sleep(0.5)
+        except Exception as e:
+            last_err = e
+
+        time.sleep(0.5)
 
     raise TimeoutException(f"Timed out opening main menu popup ({MAIN_MENU_POPUP_ID}). Last error: {last_err}")
 
@@ -583,12 +683,32 @@ def login_and_land(driver):
     pwd.send_keys(ARIAT_PASSWORD)
 
     click_button_by_text(driver, "Login", timeout=WAIT_LONG)
-    click_button_by_text(driver, "Shop Now", timeout=WAIT_LONG)
 
+    # "Shop Now" only appears on certain landing/marketing pages — skip if absent.
     try:
-        wait_and_click(driver, By.CSS_SELECTOR, "[data-testid='card-carousel-image-0']", timeout=WAIT_LONG)
+        click_button_by_text(driver, "Shop Now", timeout=15)
+        print("[INFO] Clicked 'Shop Now' landing button")
     except TimeoutException:
-        wait_and_click(driver, By.CSS_SELECTOR, ".slick-slide.slick-current", timeout=WAIT_LONG)
+        print("[INFO] 'Shop Now' not found — assuming direct app landing, continuing")
+
+    # Some accounts land on a brand/category carousel; click the first tile if present.
+    try:
+        wait_and_click(driver, By.CSS_SELECTOR, "[data-testid='card-carousel-image-0']", timeout=15)
+        print("[INFO] Clicked carousel image-0")
+    except TimeoutException:
+        try:
+            wait_and_click(driver, By.CSS_SELECTOR, ".slick-slide.slick-current", timeout=10)
+            print("[INFO] Clicked slick carousel slide")
+        except TimeoutException:
+            print("[INFO] No carousel tile found — skipping")
+
+    # Wait until the Dojo app shell is fully rendered (main menu trigger present).
+    print("[INFO] Waiting for Dojo main menu trigger to appear...")
+    WebDriverWait(driver, WAIT_LONG).until(
+        EC.presence_of_element_located((By.ID, MAIN_MENU_TRIGGER_ID))
+    )
+    wait_ready(driver)
+    time.sleep(1.5)   # let Dojo finish widget registration before we interact
 
     wait_for_import_menu_item(driver, timeout=WAIT_LONG)
 
@@ -976,11 +1096,13 @@ def main():
         col_g = df.columns[6]
         col_j = df.columns[9]
         col_k = df.columns[10]
+        col_d = df.columns[3]   # Client PO number (used for file cleanup)
 
         for idx, row in df.iterrows():
             po_number   = coerce_str(row[col_g])
             order_field = coerce_str(row[col_j])
             vendor      = coerce_str(row[col_k])
+            client_po   = coerce_str(row[col_d])
 
             if not po_number:
                 print(f"[SKIP] Row {idx}: blank PO in column G.")
