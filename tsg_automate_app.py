@@ -28,7 +28,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt, Signal, QDir
 
 # =============================================================================
@@ -280,6 +280,35 @@ QCheckBox::indicator {
 }
 QCheckBox::indicator:checked { background: #89b4fa; border-color: #89b4fa; }
 
+/* ── Tab widget ──────────────────────────────────────────────────────────── */
+QTabWidget::pane {
+    border: 1px solid #313244;
+    border-radius: 6px;
+    background: #181825;
+    top: -1px;
+}
+QTabBar::tab {
+    background: #1e1e2e;
+    color: #7f849c;
+    border: 1px solid #313244;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 5px 10px;
+    font-size: 8pt;
+    font-weight: 600;
+    min-width: 40px;
+}
+QTabBar::tab:selected {
+    background: #181825;
+    color: #89b4fa;
+    border-bottom: 2px solid #89b4fa;
+}
+QTabBar::tab:hover:!selected {
+    color: #cdd6f4;
+    background: #252535;
+}
+
 /* ── Dialogs / message boxes ─────────────────────────────────────────────── */
 QMessageBox { background-color: #181825; }
 QMessageBox QLabel { color: #cdd6f4; font-size: 10pt; }
@@ -432,6 +461,19 @@ def purge_pdfs_and_csvs(target_dir: str, log_fn):
     except FileNotFoundError:
         pass
 
+# Clear Processed_orders.xlsx by copying the blank Example.xlsx template over it
+def clear_processed_orders(workspace_dir: str, log_fn):
+    template = os.path.join(workspace_dir, "Example.xlsx")
+    target = os.path.join(workspace_dir, "Processed_orders.xlsx")
+    if not os.path.isfile(template):
+        log_fn("[WARN] Example.xlsx template not found — cannot clear Processed_orders.xlsx")
+        return
+    try:
+        shutil.copy2(template, target)
+        log_fn("🧹 Cleared Processed_orders.xlsx (reset from template).")
+    except Exception as e:
+        log_fn(f"[WARN] Could not clear Processed_orders.xlsx: {e}")
+
 # --- General helpers ----------------------------------------------------------
 def file_signature(path: str):
     try:
@@ -515,11 +557,12 @@ class PMNumberEntryDialog(QtWidgets.QDialog):
 
 # --- Manage Profiles Dialog ---------------------------------------------------
 class ManageProfilesDialog(QtWidgets.QDialog):
-    def __init__(self, profiles: dict, parent=None):
+    def __init__(self, profiles: dict, parent=None, on_generate_manifest=None):
         super().__init__(parent)
         self.setWindowTitle("Manage Profiles")
         self.resize(860, 460)
         self.profiles = {k: dict(v) for k, v in profiles.items()}
+        self._on_generate_manifest = on_generate_manifest
 
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -652,7 +695,30 @@ class ManageProfilesDialog(QtWidgets.QDialog):
         right.addRow("", self.propper_show)
         right.addRow("Workspace Folder", ws_row)
         right.addRow("Download Folder", dl_row)
-        layout.addWidget(right_widget, 2)
+
+        # Wrap right-side form + developer tools in a tab widget
+        right_tabs = QtWidgets.QTabWidget()
+        right_tabs.addTab(right_widget, "Profile")
+
+        # Developer tab (hidden utility for generating update manifests)
+        dev_page = QtWidgets.QWidget()
+        dev_lay = QtWidgets.QVBoxLayout(dev_page)
+        dev_lay.setContentsMargins(12, 12, 12, 12)
+        dev_lay.setSpacing(8)
+        dev_label = QtWidgets.QLabel("Developer tools for publishing app updates.")
+        dev_label.setStyleSheet("color: #7f849c; font-size: 9pt;")
+        dev_lay.addWidget(dev_label)
+        btn_gen_manifest = QtWidgets.QPushButton("🔄  Generate Update Manifest")
+        btn_gen_manifest.setProperty("btnstyle", "manage")
+        if self._on_generate_manifest:
+            btn_gen_manifest.clicked.connect(self._on_generate_manifest)
+        else:
+            btn_gen_manifest.setEnabled(False)
+        dev_lay.addWidget(btn_gen_manifest)
+        dev_lay.addStretch(1)
+        right_tabs.addTab(dev_page, "Developer")
+
+        layout.addWidget(right_tabs, 2)
 
         # ── Bottom: save / close ────────────────────────────────────────────
         outer_v = QtWidgets.QVBoxLayout()
@@ -918,9 +984,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_active = False
         self.active_workers = []
 
-        # ── Hidden dev menu (Ctrl+Shift+D) ──────────────────────────────────
-        self._init_dev_menu()
-
         # ── Central widget ──────────────────────────────────────────────────
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -966,80 +1029,129 @@ class MainWindow(QtWidgets.QMainWindow):
                        self.refresh_paths_and_ui())
         )
 
-        # ── Workflow steps group ────────────────────────────────────────────
-        steps_group = QtWidgets.QGroupBox("Workflow Steps")
-        steps_layout = QtWidgets.QVBoxLayout(steps_group)
-        steps_layout.setSpacing(4)
+        # ── Create all buttons ──────────────────────────────────────────────
 
-        self.btn_extract  = self._btn("📄  Extract From PDF",         "step")
-        self.btn_broberry = self._btn("🛒  Place in Broberry Shop",   "step")
-        self.btn_download = self._btn("⬇  Download XML",              "step")
-        self.btn_pad      = self._btn("📋  Place in PM",              "step")
-        self.btn_wrg      = self._btn("📦  Place Orders with Vendor", "step")
-        self.btn_wrg_only   = self._btn("🤠  Place with Wrangler",    "step")
-        self.btn_ariat_only = self._btn("👢  Place with Ariat",       "step")
-        self.btn_finalize_vendor = self._btn("🚀  Finalize With Vendor",   "verify")
-        self.btn_finalize_vendor.setEnabled(False)
-        self.btn_finalize_vendor.setToolTip("Review the order in the browser, then click to submit it")
-        self.btn_propper_only = self._btn("🪖  Place with Propper",   "step")
-        self.btn_wrg_only.setToolTip("Run PMtoWRG.py directly")
-        self.btn_ariat_only.setToolTip("Run PMtoARIAT.py directly")
-        self.btn_propper_only.setToolTip("Run PMtoPropper.py directly")
-        self.btn_get_order_ids = self._btn("🔍  Get Order IDs",       "step")
-
-        self.btn_backorders = self._btn("♻  Place Back-Orders",        "step")
-        self.btn_backorders.setToolTip("Place previously skipped (back-order) orders, then enter PM numbers")
-        self.btn_verify = self._btn("✅  Verification Complete", "verify")
+        # Main Workflow
+        self.btn_run_to_pm = self._btn("▶  Run to PM",                  "go")
+        self.btn_run_to_pm.setToolTip("Extract → Broberry → Download → enter PM numbers → merge")
+        self.btn_wrg       = self._btn("📦  Place Orders with Vendors", "step")
+        self.btn_verify    = self._btn("✅  Verification Complete",     "verify")
         self.btn_verify.setEnabled(False)
         self.btn_verify.setToolTip("Click after completing browser verification")
+        self.btn_finalize_vendor = self._btn("🚀  Finalize With Vendor", "verify")
+        self.btn_finalize_vendor.setEnabled(False)
+        self.btn_finalize_vendor.setToolTip("Review the order in the browser, then click to submit it")
 
-        for btn in (self.btn_extract, self.btn_broberry, self.btn_download,
-                    self.btn_pad, self.btn_wrg,
-                    self.btn_wrg_only, self.btn_ariat_only, self.btn_finalize_vendor,
-                    self.btn_propper_only,
-                    self.btn_get_order_ids, self.btn_backorders, self.btn_verify):
-            steps_layout.addWidget(btn)
-
-        sidebar_layout.addWidget(steps_group)
-
-        # ── Pipelines group ─────────────────────────────────────────────────
-        pipe_group = QtWidgets.QGroupBox("Pipelines")
-        pipe_layout = QtWidgets.QVBoxLayout(pipe_group)
-        pipe_layout.setSpacing(4)
-
-        self.btn_run_all   = self._btn("▶  Run All Steps",       "go")
-        self.btn_run_to_pm = self._btn("▶  Run to PM (Manual)",  "go")
-        self.btn_run_all.setToolTip("Extract → Broberry → Download → PM → Vendor")
-        self.btn_run_to_pm.setToolTip("Extract → Broberry → Download → enter PM numbers manually → merge")
-
-        pipe_layout.addWidget(self.btn_run_all)
-        pipe_layout.addWidget(self.btn_run_to_pm)
-        sidebar_layout.addWidget(pipe_group)
-
-        # ── Utilities group ─────────────────────────────────────────────────
-        util_group = QtWidgets.QGroupBox("Utilities")
-        util_layout = QtWidgets.QVBoxLayout(util_group)
-        util_layout.setSpacing(3)
-
-        self.btn_clear_pdf       = self._btn("🧹  Clear PDF Folder",          "util")
-        self.btn_open_pdfs       = self._btn("📁  Open PDFs Folder",          "util")
-        self.btn_open_processed  = self._btn("📊  Processed Orders.xlsx",     "util")
-        self.btn_open_skipped    = self._btn("⚠   Skipped Orders.xlsx",       "util")
-
-        for btn in (self.btn_clear_pdf, self.btn_open_pdfs,
-                    self.btn_open_processed, self.btn_open_skipped):
-            util_layout.addWidget(btn)
-
-        self.btn_update_app = self._btn("🔄  Update App", "manage")
+        # Utilities
+        self.btn_clear_pdf      = self._btn("🧹  Clear PDF Folder",      "util")
+        self.btn_open_pdfs      = self._btn("📁  Open PDFs Folder",      "util")
+        self.btn_open_processed = self._btn("📊  Processed Orders.xlsx",  "util")
+        self.btn_update_app     = self._btn("🔄  Update App",            "manage")
         self.btn_update_app.setToolTip("Check for and download the latest scripts from the update server")
         if not _UPDATER_AVAILABLE:
             self.btn_update_app.setEnabled(False)
             self.btn_update_app.setToolTip("app_updater.py not found in app folder")
-        util_layout.addWidget(self.btn_update_app)
-
         self.btn_kill = self._btn("⛔  Kill Current Task", "danger")
-        util_layout.addWidget(self.btn_kill)
+
+        # Back Orders
+        self.btn_open_skipped = self._btn("⚠   Skipped Orders.xlsx",       "util")
+        self.btn_backorders   = self._btn("♻  Place Back-Orders",           "step")
+        self.btn_backorders.setToolTip("Place previously skipped (back-order) orders, then enter PM numbers")
+        self.btn_wrg2         = self._btn("📦  Place Orders with Vendors",  "step")
+
+        # Individual Steps
+        self.btn_extract       = self._btn("📄  Extract From PDF",         "step")
+        self.btn_broberry      = self._btn("🛒  Place in Broberry Shop",   "step")
+        self.btn_download      = self._btn("⬇  Download XML",              "step")
+        self.btn_run_to_pm_ind = self._btn("▶  Run to PM",                 "go")
+        self.btn_run_to_pm_ind.setToolTip("Extract → Broberry → Download → enter PM numbers → merge")
+        self.btn_enter_pm      = self._btn("🔢  Enter PM Numbers",         "step")
+        self.btn_enter_pm.setToolTip("Enter PM numbers manually and merge into Processed_orders.xlsx")
+        self.btn_wrg_only      = self._btn("🤠  Place with Wrangler",      "step")
+        self.btn_wrg_only.setToolTip("Run PMtoWRG.py directly")
+        self.btn_ariat_only    = self._btn("👢  Place with Ariat",          "step")
+        self.btn_ariat_only.setToolTip("Run PMtoARIAT.py directly")
+        self.btn_propper_only  = self._btn("🪖  Place with Propper",        "step")
+        self.btn_propper_only.setToolTip("Run PMtoPropper.py directly")
+        self.btn_verify2       = self._btn("✅  Verification Complete",     "verify")
+        self.btn_verify2.setEnabled(False)
+        self.btn_verify2.setToolTip("Click after completing browser verification")
+        self.btn_finalize_vendor2 = self._btn("🚀  Finalize With Vendor",   "verify")
+        self.btn_finalize_vendor2.setEnabled(False)
+        self.btn_finalize_vendor2.setToolTip("Review the order in the browser, then click to submit it")
+        self.btn_get_order_ids = self._btn("🔍  Get Order IDs",             "step")
+
+        # ── Main Workflow (always visible) ──────────────────────────────────
+        main_group = QtWidgets.QGroupBox("Main Workflow")
+        main_lay = QtWidgets.QVBoxLayout(main_group)
+        main_lay.setSpacing(4)
+        for btn in (self.btn_run_to_pm, self.btn_wrg,
+                    self.btn_verify, self.btn_finalize_vendor):
+            main_lay.addWidget(btn)
+        sidebar_layout.addWidget(main_group)
+
+        # ── Utilities (always visible) ──────────────────────────────────────
+        util_group = QtWidgets.QGroupBox("Utilities")
+        util_lay = QtWidgets.QVBoxLayout(util_group)
+        util_lay.setSpacing(3)
+        for btn in (self.btn_clear_pdf, self.btn_open_pdfs,
+                    self.btn_open_processed, self.btn_update_app, self.btn_kill):
+            util_lay.addWidget(btn)
         sidebar_layout.addWidget(util_group)
+
+        # ── Collapsible sections helper ─────────────────────────────────────
+        def _collapsible(title, widgets):
+            """Create a toggle header + hidden content panel."""
+            container = QtWidgets.QWidget()
+            container_lay = QtWidgets.QVBoxLayout(container)
+            container_lay.setContentsMargins(0, 0, 0, 0)
+            container_lay.setSpacing(0)
+
+            toggle = QtWidgets.QToolButton()
+            toggle.setText(f"  ▸  {title}")
+            toggle.setCheckable(True)
+            toggle.setChecked(False)
+            toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
+            toggle.setStyleSheet(
+                "QToolButton { background: #181825; color: #6c7086;"
+                " border: 1px solid #313244; border-radius: 6px;"
+                " padding: 6px 10px; font-size: 8pt; font-weight: 600;"
+                " letter-spacing: 0.06em; text-align: left; }"
+                "QToolButton:hover { color: #89b4fa; border-color: #45475a; background: #1e1e2e; }"
+                "QToolButton:checked { color: #89b4fa; }"
+            )
+            toggle.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+            panel = QtWidgets.QWidget()
+            panel_lay = QtWidgets.QVBoxLayout(panel)
+            panel_lay.setContentsMargins(0, 4, 0, 0)
+            panel_lay.setSpacing(4)
+            for w in widgets:
+                panel_lay.addWidget(w)
+            panel.setVisible(False)
+
+            def _toggle(checked):
+                panel.setVisible(checked)
+                toggle.setText(f"  ▾  {title}" if checked else f"  ▸  {title}")
+
+            toggle.toggled.connect(_toggle)
+            container_lay.addWidget(toggle)
+            container_lay.addWidget(panel)
+            return container
+
+        # ── Back Orders (collapsible) ───────────────────────────────────────
+        sidebar_layout.addWidget(_collapsible("Back Orders", [
+            self.btn_open_skipped, self.btn_backorders, self.btn_wrg2,
+        ]))
+
+        # ── Individual Steps (collapsible) ──────────────────────────────────
+        sidebar_layout.addWidget(_collapsible("Individual Steps", [
+            self.btn_extract, self.btn_broberry, self.btn_download,
+            self.btn_run_to_pm_ind, self.btn_enter_pm,
+            self.btn_wrg_only, self.btn_ariat_only, self.btn_propper_only,
+            self.btn_verify2, self.btn_finalize_vendor2,
+            self.btn_get_order_ids,
+        ]))
 
         sidebar_layout.addStretch(1)
 
@@ -1083,26 +1195,36 @@ class MainWindow(QtWidgets.QMainWindow):
         root.addWidget(right, 1)
 
         # ── Wire up buttons ─────────────────────────────────────────────────
-        self.btn_extract.clicked.connect(lambda: self.run_script("PDFExtract.py"))
-        self.btn_broberry.clicked.connect(lambda: self.run_script("BroberryShop.py"))
-        self.btn_download.clicked.connect(lambda: self.run_script("ShoptoPM.py"))
-        self.btn_pad.clicked.connect(self.run_pad_flow_sequence)
-        self.btn_wrg.clicked.connect(self.run_orders_with_vendor)
-        self.btn_wrg_only.clicked.connect(self.run_pm_to_wrg)
-        self.btn_ariat_only.clicked.connect(self.run_pm_to_ariat)
-        self.btn_finalize_vendor.clicked.connect(self.finalize_vendor_order)
-        self.btn_propper_only.clicked.connect(self.run_pm_to_propper)
-        self.btn_get_order_ids.clicked.connect(self.run_get_order_ids)
-        self.btn_backorders.clicked.connect(self.run_backorders_then_pm)
-        self.btn_verify.clicked.connect(self.verification_complete)
-        self.btn_run_all.clicked.connect(self.run_all_steps)
+        # Main Workflow
         self.btn_run_to_pm.clicked.connect(self.run_to_pm_manual)
+        self.btn_wrg.clicked.connect(self.run_orders_with_vendor)
+        self.btn_verify.clicked.connect(self.verification_complete)
+        self.btn_finalize_vendor.clicked.connect(self.finalize_vendor_order)
+
+        # Utilities
         self.btn_clear_pdf.clicked.connect(self.clear_pdf_folder)
         self.btn_open_pdfs.clicked.connect(self.open_pdfs_folder)
         self.btn_open_processed.clicked.connect(self.open_processed_orders)
-        self.btn_open_skipped.clicked.connect(self.open_skipped_orders)
-        self.btn_kill.clicked.connect(self.kill_current_task)
         self.btn_update_app.clicked.connect(self.update_app)
+        self.btn_kill.clicked.connect(self.kill_current_task)
+
+        # Back Orders
+        self.btn_open_skipped.clicked.connect(self.open_skipped_orders)
+        self.btn_backorders.clicked.connect(self.run_backorders_then_pm)
+        self.btn_wrg2.clicked.connect(self.run_orders_with_vendor)
+
+        # Individual Steps
+        self.btn_extract.clicked.connect(self.run_extract_pdf)
+        self.btn_broberry.clicked.connect(lambda: self.run_script("BroberryShop.py"))
+        self.btn_download.clicked.connect(lambda: self.run_script("ShoptoPM.py"))
+        self.btn_run_to_pm_ind.clicked.connect(self.run_to_pm_manual)
+        self.btn_enter_pm.clicked.connect(self.enter_pm_numbers_manual)
+        self.btn_wrg_only.clicked.connect(self.run_pm_to_wrg)
+        self.btn_ariat_only.clicked.connect(self.run_pm_to_ariat)
+        self.btn_propper_only.clicked.connect(self.run_pm_to_propper)
+        self.btn_verify2.clicked.connect(self.verification_complete)
+        self.btn_finalize_vendor2.clicked.connect(self.finalize_vendor_order)
+        self.btn_get_order_ids.clicked.connect(self.run_get_order_ids)
 
         # ── Initialize paths/UI for selected profile ────────────────────────
         self.refresh_paths_and_ui()
@@ -1114,6 +1236,14 @@ class MainWindow(QtWidgets.QMainWindow):
             b.setProperty("btnstyle", style)
         return b
 
+    # --- Synced enable/disable for verify + finalize across tabs -----------
+    def _set_verify_enabled(self, on: bool):
+        self.btn_verify.setEnabled(on)
+        self.btn_verify2.setEnabled(on)
+
+    def _set_finalize_enabled(self, on: bool):
+        self.btn_finalize_vendor.setEnabled(on)
+        self.btn_finalize_vendor2.setEnabled(on)
 
     # --- Kill current task ---
     def kill_current_task(self):
@@ -1302,7 +1432,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- Profiles ---
     def manage_profiles(self):
-        dlg = ManageProfilesDialog(self.profiles, self)
+        dlg = ManageProfilesDialog(self.profiles, self, on_generate_manifest=self.run_generate_manifest)
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             cur = self.profile_combo.currentText()
             self.profiles = load_profiles()
@@ -1360,7 +1490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def _done(rc):
             self.log(f"◆ {tag} exited with code {rc}")
             if worker is self.running.pm_to_wrg:
-                self.btn_verify.setEnabled(False)
+                self._set_verify_enabled(False)
                 self.running.pm_to_wrg = None
             try:
                 self.active_workers.remove(worker)
@@ -1423,6 +1553,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         threading.Thread(target=_wait_then_merge, daemon=True).start()
 
+    # --- Extract PDF (clears Excel first) ---
+    def run_extract_pdf(self):
+        p = self.paths()
+        ensure_processed_orders_closed_path(p["processed"], self.log)
+        clear_processed_orders(p["ws"], self.log)
+        self.run_script("PDFExtract.py")
+
     # --- Wrangler flow ---
     def run_pm_to_wrg(self):
         if self.running.pm_to_wrg is not None:
@@ -1432,7 +1569,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if worker is not None:
             self.running.pm_to_wrg = worker
             self.running.interactive = worker
-            self.btn_verify.setEnabled(True)
+            self._set_verify_enabled(True)
 
             # Guidance message so users know the next step
             self.log("🧩 Complete Wrangler login verification in the browser, then press “Verification Complete ✅”.")
@@ -1446,12 +1583,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if worker is not None:
             self.running.pm_to_ariat = worker
             self.running.interactive = worker
-            self.btn_verify.setEnabled(True)
-            self.btn_finalize_vendor.setEnabled(True)
+            self._set_verify_enabled(True)
+            self._set_finalize_enabled(True)
             self.log('👢 Ariat running — review the cart in the browser, then click "Finalize With Vendor" to place it.')
 
             def _ariat_done(rc):
-                self.btn_finalize_vendor.setEnabled(False)
+                self._set_finalize_enabled(False)
             worker.finished.connect(_ariat_done)
         return worker
 
@@ -1478,12 +1615,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if worker is not None:
             self.running.pm_to_propper = worker
             self.running.interactive = worker
-            self.btn_verify.setEnabled(True)
-            self.btn_finalize_vendor.setEnabled(True)
+            self._set_verify_enabled(True)
+            self._set_finalize_enabled(True)
             self.log('🪖 Propper running — review the cart in the browser, then click "Finalize With Vendor" to place it.')
 
             def _propper_done(rc):
-                self.btn_finalize_vendor.setEnabled(False)
+                self._set_finalize_enabled(False)
             worker.finished.connect(_propper_done)
         return worker
 
@@ -1567,14 +1704,41 @@ class MainWindow(QtWidgets.QMainWindow):
         if has_propper:
             steps.append(("Propper", "PMtoPropper.py"))
 
-        def run_step(i: int):
-            if i >= len(steps):
-                self.btn_verify.setEnabled(False)
-                self.btn_finalize_vendor.setEnabled(False)
+        def run_get_order_ids_then_finish():
+            """After all vendor scripts finish, run GetOrderId, then purge old files."""
+            self.log("▶ Starting Get Order IDs…")
+            ensure_processed_orders_closed_path(processed_path, self.log)
+            worker = self.run_script("GetOrderId.py", stdin_pipe=True, label="GetOrderId.py")
+            if worker is None:
+                self.log("[ERROR] GetOrderId.py did not start.")
+                purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
+                if on_complete:
+                    on_complete(1)
+                return
+            self.running.interactive = worker
+            self._set_verify_enabled(True)
+
+            def _after_ids(rc):
                 self.running.interactive = None
+                self._set_verify_enabled(False)
+                if rc == 0:
+                    self.log("◆ Get Order IDs completed successfully.")
+                else:
+                    self.log(f"◆ Get Order IDs exited with code {rc}")
+                # Clean up PDFs/CSVs now that all orders are placed and IDs fetched
+                purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
                 self.log("◆ Place Orders with Vendor complete.")
                 if on_complete:
                     on_complete(0)
+
+            worker.finished.connect(_after_ids)
+
+        def run_step(i: int):
+            if i >= len(steps):
+                self._set_verify_enabled(False)
+                self._set_finalize_enabled(False)
+                self.running.interactive = None
+                run_get_order_ids_then_finish()
                 return
 
             vendor_name, script_name = steps[i]
@@ -1587,21 +1751,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             self.running.interactive = worker
-            self.btn_verify.setEnabled(True)
+            self._set_verify_enabled(True)
 
             if script_name == "PMtoWRG.py":
                 self.running.pm_to_wrg = worker
             elif script_name == "PMtoARIAT.py":
                 self.running.pm_to_ariat = worker
-                self.btn_finalize_vendor.setEnabled(True)
+                self._set_finalize_enabled(True)
             elif script_name == "PMtoPropper.py":
                 self.running.pm_to_propper = worker
-                self.btn_finalize_vendor.setEnabled(True)
+                self._set_finalize_enabled(True)
 
             def _after(rc):
                 self.running.interactive = None
-                self.btn_verify.setEnabled(False)
-                self.btn_finalize_vendor.setEnabled(False)
+                self._set_verify_enabled(False)
+                self._set_finalize_enabled(False)
                 self.log(f"◆ {vendor_name} exited with code {rc}")
                 run_step(i + 1)
 
@@ -1623,11 +1787,11 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Track as interactive worker and enable verification button
         self.running.interactive = worker
-        self.btn_verify.setEnabled(True)
+        self._set_verify_enabled(True)
         
         def _after(rc):
             self.running.interactive = None
-            self.btn_verify.setEnabled(False)
+            self._set_verify_enabled(False)
             if rc == 0:
                 self.log("◆ Get Order IDs completed successfully")
             else:
@@ -1708,9 +1872,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ensure_processed_orders_closed_path(self.paths()["processed"], self.log)
         self.log("▶ Run All Steps starting…")
 
-        # Purge leftover PDFs/CSVs from the previous run before creating new ones.
-        purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
-
         def halt_pipeline(step_name: str, rc: int):
             self.pipeline_active = False
             self.log(f"[ERROR] {step_name} failed with exit code {rc}.")
@@ -1721,6 +1882,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log("◆ Run All Steps complete.")
 
         def start_extract():
+            clear_processed_orders(self.paths()["ws"], self.log)
             w = self.run_script("PDFExtract.py")
             if w:
                 w.finished.connect(lambda rc: start_broberry() if rc == 0 else halt_pipeline("PDFExtract.py", rc))
@@ -1749,6 +1911,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.run_orders_with_vendor(on_complete=lambda rc: end_pipeline())
 
         start_extract()
+
+    # --- Enter PM numbers standalone (dialog + merge) ---
+    def enter_pm_numbers_manual(self):
+        """Open the PM numbers dialog, write to PMNum.xlsx, and run Add_PM_Nums.py."""
+        ensure_processed_orders_closed_path(self.paths()["processed"], self.log)
+        nums = self.prompt_pm_numbers()
+        if not nums:
+            return
+        if not self.write_pm_numbers_excel(nums):
+            return
+        self.log("▶︎ Running Add_PM_Nums.py…")
+        self.run_script("Add_PM_Nums.py", label="Add_PM_Nums.py")
 
     # --- Manual PM numbers flow (Run to PM) ---
     def prompt_pm_numbers(self):
@@ -1791,9 +1965,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ensure_processed_orders_closed_path(self.paths()["processed"], self.log)
         self.log("▶ Run to PM (manual) starting…")
 
-        # Purge leftover PDFs/CSVs from the previous run before creating new ones.
-        purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
-
         def halt_pipeline(step_name: str, rc: int):
             self.pipeline_active = False
             self.log(f"[ERROR] {step_name} failed with exit code {rc}.")
@@ -1804,6 +1975,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log("◆ Run to PM (manual) complete.")
 
         def start_extract():
+            clear_processed_orders(self.paths()["ws"], self.log)
             w = self.run_script("PDFExtract.py")
             if w:
                 w.finished.connect(lambda rc: start_broberry() if rc == 0 else halt_pipeline("PDFExtract.py", rc))
@@ -1843,20 +2015,6 @@ class MainWindow(QtWidgets.QMainWindow):
     # --- Clear PDF folder ---
     def clear_pdf_folder(self):
         purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
-
-    # --- Hidden dev menu (Ctrl+Shift+D) ---
-    def _init_dev_menu(self):
-        """Create a hidden Dev menu accessible only via Ctrl+Shift+D."""
-        dev_menu = self.menuBar().addMenu("Dev")
-        dev_menu.menuAction().setVisible(False)  # hide from menu bar
-
-        gen_manifest = dev_menu.addAction("Generate Manifest")
-        gen_manifest.triggered.connect(self.run_generate_manifest)
-
-        shortcut = QtGui.QShortcut(QtCore.QKeyCombination(
-            Qt.ControlModifier | Qt.ShiftModifier, Qt.Key_D
-        ), self)
-        shortcut.activated.connect(lambda: dev_menu.exec(self.mapToGlobal(QtCore.QPoint(10, 30))))
 
     def run_generate_manifest(self):
         self.log("▶ Running generate_manifest.py…")

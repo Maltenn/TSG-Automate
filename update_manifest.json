@@ -1,11 +1,11 @@
 {
   "version": "1.0.0",
-  "updated": "2026-04-10",
+  "updated": "2026-04-14",
   "files": [
     {
       "name": "tsg_automate_app.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/tsg_automate_app.py",
-      "sha256": "d70a5c7c3ffd7ca9a48522ede2c5f57ef4cd134cb9b8bd7c7c35b27ebea7a6e9"
+      "sha256": "58aed1819fc68a85a1fdc713c20b7383110425cd0a6138f529b5eb43593b9b25"
     },
     {
       "name": "app_updater.py",
