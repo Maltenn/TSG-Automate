@@ -502,7 +502,9 @@ def try_add_line(driver, sku, waist, inseam, qty):
         return ('unavailable', 'qty input disabled')
 
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", qty_input)
-    qty_input.click()
+    # JS focus instead of .click(): each cell now has a hover-triggered price tooltip
+    # (absolute-positioned w-80 div, group-hover:flex) that intercepts mouse clicks.
+    driver.execute_script("arguments[0].focus();", qty_input)
     qty_input.send_keys(Keys.CONTROL, "a")
     qty_input.send_keys(Keys.DELETE)
     qty_input.send_keys(str(qty))
@@ -691,7 +693,11 @@ def fill_address_and_notes(driver, po, notes,
     if city_el and _norm(ship_city):
         city_el.clear(); city_el.send_keys(_norm(ship_city))
     if zip_el and _norm(ship_zip):
-        zip_el.click()
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", zip_el)
+        # JS focus instead of .click(): the right-column order summary overlays the
+        # zip field at some scroll positions and intercepts mouse clicks. CTRL+A +
+        # send_keys is kept because .clear() is unreliable on type=number inputs.
+        driver.execute_script("arguments[0].focus();", zip_el)
         zip_el.send_keys(Keys.CONTROL, "a")
         zip_el.send_keys(_norm(ship_zip))
 
@@ -704,9 +710,13 @@ def fill_address_and_notes(driver, po, notes,
         except Exception:
             pass
 
-    wait.until(EC.element_to_be_clickable((
+    # JS click: the 2-column checkout layout has a short right column, so after
+    # scrolling the zip field into view this button ends up above the viewport
+    # and a coordinate-based click is rejected.
+    continue_btn = wait.until(EC.element_to_be_clickable((
         By.CSS_SELECTOR, "button.w-full.rounded-md.bg-rose-600"
-    ))).click()
+    )))
+    driver.execute_script("arguments[0].click();", continue_btn)
     time.sleep(1)
 
 def fill_shipper_number(driver, shipper_number):
@@ -903,9 +913,10 @@ def process_csv(driver, csv_path):
                           ship_street, ship_city, ship_state, ship_zip)
 
     wait = WebDriverWait(driver, 10)
-    wait.until(EC.element_to_be_clickable((
+    continue_btn = wait.until(EC.element_to_be_clickable((
         By.XPATH, "//button[contains(., 'Continue To Shipping and Payment Method')]"
-    ))).click()
+    )))
+    driver.execute_script("arguments[0].click();", continue_btn)
 
     # Fill shipper number on the shipping-and-payment page if needed
     if shipper_number:
@@ -928,9 +939,10 @@ def process_csv(driver, csv_path):
     except ElementClickInterceptedException:
         driver.execute_script("arguments[0].click();", pay)
 
-    wait.until(EC.element_to_be_clickable((
+    review_btn = wait.until(EC.element_to_be_clickable((
         By.XPATH, "//button[contains(., 'Continue and Review Order')]"
-    ))).click()
+    )))
+    driver.execute_script("arguments[0].click();", review_btn)
 
     submit_order(driver)
 

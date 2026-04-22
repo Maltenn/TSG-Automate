@@ -1,11 +1,11 @@
 {
   "version": "1.0.0",
-  "updated": "2026-04-14",
+  "updated": "2026-04-22",
   "files": [
     {
       "name": "tsg_automate_app.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/tsg_automate_app.py",
-      "sha256": "58aed1819fc68a85a1fdc713c20b7383110425cd0a6138f529b5eb43593b9b25"
+      "sha256": "b79123ee541371b9eef27f5242d4f46268a400218cfe27677d17807e6923141b"
     },
     {
       "name": "app_updater.py",
@@ -20,12 +20,12 @@
     {
       "name": "BroberryShop.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/BroberryShop.py",
-      "sha256": "bba11704eb59e9cd587f9d4cf7678aac8cf2c1ca7cd0c43c884f5295d9c3bfc0"
+      "sha256": "7813edb5949f4121394cf7deadd12c378ca06bff687ab5a5624ab8c961b138ab"
     },
     {
       "name": "BroberryShop_Backorders.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/BroberryShop_Backorders.py",
-      "sha256": "818cd199880de1448ebe034831a4b70b9c913eac66771e9d2da9ae3ab0a3fc3f"
+      "sha256": "44caf189ab901c46bc11a1b5a4341ada00e256afe1a992e202eefa8fdff91748"
     },
     {
       "name": "ShoptoPM.py",
@@ -45,7 +45,7 @@
     {
       "name": "PMtoARIAT.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoARIAT.py",
-      "sha256": "64dc80c03a81847a9881ce38122ae0174bafa8b07d3c2bbf9cfec3a41594ec7f"
+      "sha256": "a01693b0820974a2eaa2485c863fc9cc5732e8eb39a2d1fd64c0ae1198ede1f8"
     },
     {
       "name": "PMtoPropper.py",

@@ -186,116 +186,236 @@ def click_dijit_button_by_label(driver, label_text: str, timeout=WAIT_LONG, pref
 
 # ─── DOJO MAIN MENU (CRITICAL) ──────────────────────────────────────────────
 MAIN_MENU_TRIGGER_ID = "dijit__WidgetsInTemplateMixin_1"
-MAIN_MENU_POPUP_ID   = "dijit__WidgetsInTemplateMixin_1_dropdown"
-# NOTE: Do NOT use a hardcoded dijit_MenuItem_NN_text ID here — the numeric
-# suffix shifts whenever Dojo re-renders, which caused the wrong item (Export
-# XLSX) to be clicked.  We now locate the row by its stable import_csv CSS
-# class instead (see click_import_a_file below).
-# The ID below is intentionally unused — selector-based lookup is used instead.
+# NOTE: The popup container ID is read dynamically from the trigger's
+# aria-owns attribute (typically 'dijit_DropDownMenu_<n>').  Dojo regenerates
+# the numeric suffix on re-render, so a hardcoded constant becomes wrong
+# over time — that mismatch was the actual cause of the long-standing
+# "struggles to select the Import a File menu" bug: the trigger was firing
+# correctly, but is_main_menu_open() looked up a non-existent ID and always
+# returned False, so open_main_menu()'s retry loop kept JS-clicking the
+# trigger and toggling the menu closed again.
+# Same lesson as the menu items: do NOT pin to dijit_*_NN IDs.
 IMPORT_MENU_LABEL_TD_ID = None  # deprecated; kept for reference only
 
 
-def is_main_menu_open(driver) -> bool:
+def _resolve_main_menu_popup_id(driver):
+    """Read the live popup container ID from the trigger's aria-owns.
+
+    Returns the ID string, or None if the trigger isn't on the page yet.
+    """
     try:
-        popup = driver.find_element(By.ID, MAIN_MENU_POPUP_ID)
-        style = (popup.get_attribute("style") or "").lower()
-        return ("visibility: visible" in style) and popup.is_displayed()
+        trig = driver.find_element(By.ID, MAIN_MENU_TRIGGER_ID)
+        owns = trig.get_attribute("aria-owns") or trig.get_attribute("aria-controls")
+        return owns.strip() if owns else None
     except Exception:
-        return False
+        return None
+
+
+def is_main_menu_open(driver) -> bool:
+    """Truthful detection of the Dojo main menu's open state.
+
+    Three independent signals — ANY ONE is sufficient:
+      1. trigger element carries popupactive='true'  (authoritative, set by Dojo)
+      2. the popup container referenced by aria-owns is visible
+      3. a known menu row (tr.import_csv) is visible in the DOM
+
+    Multiple signals exist because Dojo's ARIA bookkeeping isn't always
+    consistent (e.g. popupactive='true' alongside aria-expanded='false').
+    """
+    # 1) popupactive attribute on the trigger — fastest and most reliable
+    try:
+        trig = driver.find_element(By.ID, MAIN_MENU_TRIGGER_ID)
+        if (trig.get_attribute("popupactive") or "").lower() == "true":
+            return True
+    except Exception:
+        pass
+
+    # 2) popup container resolved via aria-owns
+    popup_id = _resolve_main_menu_popup_id(driver)
+    if popup_id:
+        try:
+            popup = driver.find_element(By.ID, popup_id)
+            style = (popup.get_attribute("style") or "").lower()
+            if popup.is_displayed() or "visibility: visible" in style:
+                return True
+        except Exception:
+            pass
+
+    # 3) the menu item we ultimately want is already visible
+    try:
+        item = driver.find_element(By.CSS_SELECTOR, "tr.import_csv")
+        if item.is_displayed():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _find_main_menu_trigger(driver, timeout=5):
+    """Locate the Menu-button trigger with resilient fallbacks.
+
+    Dijit regenerates the widget ID suffix on re-render.  Try the expected
+    ID first, then fall back to stable class/widgetid selectors.
+    Returns the outer wrapper element (the div.mainMenu) or None.
+    """
+    selectors = [
+        (By.ID, MAIN_MENU_TRIGGER_ID),
+        (By.CSS_SELECTOR, f"*[widgetid='{MAIN_MENU_TRIGGER_ID}']"),
+        (By.CSS_SELECTOR, "div.mainMenu.main-menu"),
+        (By.CSS_SELECTOR, "div.mainMenu.dijitDownArrowButton"),
+        (By.CSS_SELECTOR, "div.mainMenu"),
+    ]
+    for by, sel in selectors:
+        try:
+            el = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((by, sel))
+            )
+            return el
+        except TimeoutException:
+            continue
+    return None
 
 
 def open_main_menu(driver, timeout=WAIT_LONG):
     """
-    Opens the Dojo hover/click main menu.  Tries multiple strategies in order:
-      1. ActionChains hover over the outer wrapper div (correct for hover menus)
-      2. ActionChains hover over the inner role=button span (dijit_form_Button_6)
-      3. JS click on the inner role=button span
-      4. JS click on the outer wrapper div
-      5. aria-owns CSS selector fallback click
-    Each strategy waits up to 6 s for the popup to become visible before
-    retrying the whole loop.
+    Opens the Ariat Dojo main menu (the top-right "Menu" dropdown button).
+
+    This is a dijit click-to-open dropdown (class contains
+    'dijitDownArrowButton'), NOT a hover menu — so click strategies come
+    first, using methods that fire a real native click event and propagate
+    it through Dojo's ondijitclick handler on the dijitButtonNode.
+
+    Strategies (in order), each followed by a short wait for the popup:
+      1. Native Selenium .click() on the inner role=button span
+      2. Native Selenium .click() on the dijitButtonNode parent (where
+         the ondijitclick listener actually lives)
+      3. ActionChains real mouse click at the button's center
+      4. Keyboard activation: focus the inner button + press Enter/Space
+      5. JS click on the inner role=button span
+      6. JS click on the offscreen <input> helper (onclick:_onClick)
+      7. Synthetic MouseEvent dispatch (mousedown + mouseup + click)
+      8. Hover fallbacks (for the rare case the widget behaves as hover)
     """
     end = time.time() + timeout
     last_err = None
+    attempt = 0
 
     while time.time() < end:
         if is_main_menu_open(driver):
             return
+        attempt += 1
+        print(f"[INFO] open_main_menu: cycle {attempt}")
 
-        # ── Resolve trigger elements ──────────────────────────────────────────
-        trigger_outer = None
-        trigger_inner = None   # the actual role=button span inside the wrapper
+        trigger_outer = _find_main_menu_trigger(driver, timeout=5)
+        if trigger_outer is None:
+            last_err = TimeoutException("Could not locate main menu trigger wrapper.")
+            print("[WARN] open_main_menu: trigger wrapper not found, retrying...")
+            time.sleep(0.5)
+            continue
 
         try:
-            trigger_outer = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((By.ID, MAIN_MENU_TRIGGER_ID))
-            )
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", trigger_outer)
-        except Exception as e:
-            last_err = e
+        except Exception:
+            pass
 
-        if trigger_outer is not None:
-            try:
-                # The visible "Menu" button is the first role=button span inside the wrapper
-                trigger_inner = trigger_outer.find_element(
-                    By.CSS_SELECTOR, "span[role='button']"
-                )
-            except Exception:
-                trigger_inner = trigger_outer
-
-        # ── Strategy 1: hover outer wrapper (standard Dojo hover menu) ────────
-        if trigger_outer is not None:
-            try:
-                ActionChains(driver).move_to_element(trigger_outer).perform()
-                WebDriverWait(driver, 6).until(lambda d: is_main_menu_open(d))
-                return
-            except Exception as e:
-                last_err = e
-
-        # ── Strategy 2: hover inner role=button span ──────────────────────────
-        if trigger_inner is not None:
-            try:
-                ActionChains(driver).move_to_element(trigger_inner).perform()
-                WebDriverWait(driver, 6).until(lambda d: is_main_menu_open(d))
-                return
-            except Exception as e:
-                last_err = e
-
-        # ── Strategy 3: JS click inner button span ────────────────────────────
-        if trigger_inner is not None:
-            try:
-                driver.execute_script("arguments[0].click();", trigger_inner)
-                WebDriverWait(driver, 6).until(lambda d: is_main_menu_open(d))
-                return
-            except Exception as e:
-                last_err = e
-
-        # ── Strategy 4: JS click outer wrapper ───────────────────────────────
-        if trigger_outer is not None:
-            try:
-                driver.execute_script("arguments[0].click();", trigger_outer)
-                WebDriverWait(driver, 6).until(lambda d: is_main_menu_open(d))
-                return
-            except Exception as e:
-                last_err = e
-
-        # ── Strategy 5: aria-owns CSS selector ───────────────────────────────
+        # Inner clickable elements
+        trigger_inner = None       # inner <span role="button">
+        trigger_button_node = None # <span class="dijitButtonNode"> (has ondijitclick)
+        trigger_offscreen = None   # <input class="dijitOffScreen">
         try:
-            trigger_css = WebDriverWait(driver, 4).until(
-                EC.presence_of_element_located((
-                    By.CSS_SELECTOR,
-                    f"*[aria-owns='{MAIN_MENU_POPUP_ID}'], *[aria-controls='{MAIN_MENU_POPUP_ID}']"
-                ))
+            trigger_inner = trigger_outer.find_element(By.CSS_SELECTOR, "span[role='button']")
+        except Exception:
+            pass
+        try:
+            trigger_button_node = trigger_outer.find_element(
+                By.CSS_SELECTOR, "span.dijitButtonNode"
             )
-            ActionChains(driver).move_to_element(trigger_css).perform()
-            WebDriverWait(driver, 6).until(lambda d: is_main_menu_open(d))
-            return
-        except Exception as e:
-            last_err = e
+        except Exception:
+            pass
+        try:
+            trigger_offscreen = trigger_outer.find_element(
+                By.CSS_SELECTOR, "input.dijitOffScreen"
+            )
+        except Exception:
+            pass
+
+        def _wait_open(sec=2.0):
+            """Poll is_main_menu_open for up to `sec` seconds."""
+            deadline = time.time() + sec
+            while time.time() < deadline:
+                if is_main_menu_open(driver):
+                    return True
+                time.sleep(0.1)
+            return False
+
+        strategies = []
+        if trigger_inner is not None:
+            strategies.append(("native click inner[role=button]", lambda: trigger_inner.click()))
+        if trigger_button_node is not None:
+            strategies.append(("native click dijitButtonNode",    lambda: trigger_button_node.click()))
+        if trigger_inner is not None:
+            strategies.append((
+                "ActionChains click inner",
+                lambda: ActionChains(driver).move_to_element(trigger_inner).pause(0.1).click().perform()
+            ))
+            strategies.append((
+                "keyboard Enter on inner",
+                lambda: trigger_inner.send_keys(Keys.ENTER)
+            ))
+            strategies.append((
+                "JS click inner",
+                lambda: driver.execute_script("arguments[0].click();", trigger_inner)
+            ))
+        if trigger_offscreen is not None:
+            strategies.append((
+                "JS click offscreen input",
+                lambda: driver.execute_script("arguments[0].click();", trigger_offscreen)
+            ))
+        if trigger_inner is not None:
+            strategies.append((
+                "dispatch MouseEvent sequence",
+                lambda: driver.execute_script(
+                    "var el=arguments[0];"
+                    "['mousedown','mouseup','click'].forEach(function(t){"
+                    "  el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));"
+                    "});",
+                    trigger_inner,
+                )
+            ))
+        # Hovers last — included only in case the widget behaves as hover-trigger.
+        if trigger_outer is not None:
+            strategies.append((
+                "hover outer (fallback)",
+                lambda: ActionChains(driver).move_to_element(trigger_outer).perform()
+            ))
+        if trigger_inner is not None:
+            strategies.append((
+                "hover inner (fallback)",
+                lambda: ActionChains(driver).move_to_element(trigger_inner).perform()
+            ))
+
+        for name, action in strategies:
+            try:
+                action()
+            except Exception as e:
+                last_err = e
+                print(f"[WARN] open_main_menu: strategy '{name}' raised: {e}")
+                continue
+
+            if _wait_open(sec=2.0):
+                print(f"[INFO] open_main_menu: opened via '{name}'")
+                return
+            else:
+                print(f"[WARN] open_main_menu: '{name}' did not open popup within 2s")
 
         time.sleep(0.5)
 
-    raise TimeoutException(f"Timed out opening main menu popup ({MAIN_MENU_POPUP_ID}). Last error: {last_err}")
+    resolved = _resolve_main_menu_popup_id(driver) or "unresolved"
+    raise TimeoutException(
+        f"Timed out opening main menu popup (trigger={MAIN_MENU_TRIGGER_ID}, "
+        f"aria-owns={resolved}). Last error: {last_err}"
+    )
 
 
 def wait_for_import_menu_item(driver, timeout=WAIT_LONG):
@@ -316,55 +436,126 @@ def wait_for_import_menu_item(driver, timeout=WAIT_LONG):
 
 
 def click_import_a_file(driver, timeout=WAIT_LONG):
+    """Activate the 'Import a File' menu item.
+
+    Dijit menu items use event delegation on their parent menu widget —
+    a plain JS click on the <tr> is often ignored.  The reliable click
+    targets, in order, are:
+        - the inner <td class="dijitMenuItemLabel"> (real <td> with text)
+        - the <tr role="menuitem"> itself via native/ActionChains click
+    We try each with several click methods and detect success by waiting
+    for the import dialog's "Paste From Clipboard" control to appear.
+    """
     open_main_menu(driver, timeout=timeout)
+    time.sleep(0.4)  # let menu items finish rendering after popup opens
 
-    # Give the Dojo menu animation a moment to finish rendering items.
-    time.sleep(0.6)
-
-    # Selector priority:
-    #  1. tr.import_csv  — most stable; purpose-built class, independent of dijit ID.
-    #  2. XPath on the <tr> class attribute directly.
-    #  3. Locate the label <td> by visible text and climb to the <tr>.
-    #  4. Click the label <td> directly (works when <tr> intercepts differently).
-    #  5. Broad aria-label contains match as last resort.
-    _IMPORT_SELECTORS = [
+    _DIALOG_SIGNAL_XPATH = (
+        "//*[contains(@class,'singleValue') and normalize-space()='Paste From Clipboard']"
+    )
+    _ROW_SELECTORS = [
         (By.CSS_SELECTOR, "tr.import_csv"),
         (By.XPATH,        "//tr[contains(@class,'import_csv')]"),
         (By.XPATH,        "//td[normalize-space()='Import a File']/ancestor::tr[1]"),
-        (By.XPATH,        "//td[normalize-space()='Import a File']"),
-        (By.XPATH,        "//*[contains(normalize-space(@aria-label),'Import a File')]"),
     ]
 
-    el = None
-    for by, sel in _IMPORT_SELECTORS:
+    def _dialog_opened() -> bool:
         try:
-            # Use presence_of_element_located — Dojo <tr> rows are often not
-            # considered "clickable" by Selenium even when fully interactive.
-            el = WebDriverWait(driver, 12).until(
-                EC.presence_of_element_located((by, sel))
-            )
-            print(f"[INFO] Located 'Import a File' with selector: {sel}")
-            break
-        except TimeoutException:
-            print(f"[WARN] Selector did not match, trying next: {sel}")
+            els = driver.find_elements(By.XPATH, _DIALOG_SIGNAL_XPATH)
+            return any(e.is_displayed() for e in els)
+        except Exception:
+            return False
+
+    def _locate_row_and_label():
+        row = None
+        for by, sel in _ROW_SELECTORS:
+            try:
+                row = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((by, sel))
+                )
+                break
+            except TimeoutException:
+                continue
+        if row is None:
+            return None, None
+        label = None
+        try:
+            label = row.find_element(By.CSS_SELECTOR, "td.dijitMenuItemLabel")
+        except Exception:
+            try:
+                label = row.find_element(
+                    By.XPATH, ".//td[normalize-space()='Import a File']"
+                )
+            except Exception:
+                label = None
+        return row, label
+
+    row, label = _locate_row_and_label()
+    if row is None:
+        raise TimeoutException(
+            "Could not locate 'Import a File' menu row using any selector."
+        )
+    print(f"[INFO] Located 'Import a File' row (label-td: {'yes' if label else 'no'})")
+
+    # (strategy_name, target_kind, action)
+    click_actions = [
+        ("native click label",       "label",
+            lambda el: el.click()),
+        ("ActionChains click label", "label",
+            lambda el: ActionChains(driver).move_to_element(el).pause(0.08).click().perform()),
+        ("JS click label",           "label",
+            lambda el: driver.execute_script("arguments[0].click();", el)),
+        ("native click row",         "row",
+            lambda el: el.click()),
+        ("ActionChains click row",   "row",
+            lambda el: ActionChains(driver).move_to_element(el).pause(0.08).click().perform()),
+        ("JS click row",             "row",
+            lambda el: driver.execute_script("arguments[0].click();", el)),
+        ("MouseEvent seq on label",  "label",
+            lambda el: driver.execute_script(
+                "var el=arguments[0];"
+                "['mousedown','mouseup','click'].forEach(function(t){"
+                "  el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));"
+                "});",
+                el,
+            )),
+    ]
+
+    for name, target_kind, action in click_actions:
+        # If the menu closed between attempts (a failed click can dismiss
+        # it), re-open before retrying.
+        if not is_main_menu_open(driver):
+            print(f"[INFO] click_import_a_file: menu closed, re-opening before '{name}'")
+            open_main_menu(driver, timeout=timeout)
+            time.sleep(0.3)
+
+        # Re-locate fresh each attempt — Dojo may rebuild the DOM.
+        row, label = _locate_row_and_label()
+        if row is None:
+            print(f"[WARN] click_import_a_file: row not found before '{name}', skipping")
             continue
 
-    if el is None:
-        raise TimeoutException(
-            "Could not locate the 'Import a File' menu item using any selector. "
-            "Check that the main menu is open and the item is visible."
-        )
+        target = label if (target_kind == "label" and label is not None) else row
+        if target is None:
+            continue
 
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-    time.sleep(0.2)
+        try:
+            action(target)
+        except Exception as e:
+            print(f"[WARN] click_import_a_file: '{name}' raised: {e}")
+            continue
 
-    # Prefer JS click for Dojo menu items — avoids intercept issues.
-    try:
-        driver.execute_script("arguments[0].click();", el)
-    except Exception:
-        safe_click(driver, el)
+        # Give the dialog up to 4s to appear after the click
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            if _dialog_opened():
+                print(f"[INFO] click_import_a_file: dialog opened via '{name}'")
+                return row
+            time.sleep(0.15)
+        print(f"[WARN] click_import_a_file: '{name}' did not open dialog within 4s")
 
-    return el
+    raise TimeoutException(
+        "Could not activate 'Import a File' menu item — all click strategies failed."
+    )
 # ────────────────────────────────────────────────────────────────────────────────
 
 

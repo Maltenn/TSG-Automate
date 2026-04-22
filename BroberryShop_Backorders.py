@@ -1,5 +1,8 @@
 import os
+import re
 import time
+import argparse
+from datetime import datetime, date
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -12,6 +15,7 @@ from selenium.common.exceptions import (
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.action_chains import ActionChains
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.keys import Keys
 
@@ -101,6 +105,25 @@ PRODUCT_MAP = {
         "mode": "auto",
     },
 }
+
+# ─── AUTOMATIC SUBSTITUTION PAIRS ─────────────────────────────────────────────
+# Mirrors PAIRABLE in BroberryShop.py — kept local to match the file's existing
+# pattern of carrying its own copy of PRODUCT_MAP.  Bidirectional map: each SKU
+# points at the one it may sub for.
+PAIRABLE = {
+    # CH <-> DK can sub for each other
+    "3W045CH": "3W045DK",
+    "3W045DK": "3W045CH",
+
+    # 10FR13MWZ <-> 10FR13MMS can sub for each other (back order / unavailable)
+    "10FR13MWZ": "10FR13MMS",
+    "10FR13MMS": "10FR13MWZ",
+}
+
+# Module-level flag set by main() from argparse.  When True, process_backorder_csv
+# will compare the restock dates of an item and its registered sub and place
+# whichever has the sooner date.  See pick_best_sku() below.
+PREFER_SOONER_BO = False
 
 # ─── DRIVER SETUP ─────────────────────────────────────────────────────────────
 def init_driver():
@@ -284,6 +307,272 @@ def try_add_line(driver, sku, waist, inseam, qty):
 
     time.sleep(1)
     return ('added', None)
+
+
+# ─── RESTOCK DATE LOOKUP (for --prefer-sooner mode) ───────────────────────────
+_RESTOCK_DATE_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b")
+
+
+def read_restock_info(driver, sku, waist, inseam):
+    """Look up orderability AND the backorder Restock Date for one
+    (sku, waist, inseam) on the product page.
+
+    Returns a dict::
+
+        {"orderable": bool, "restock_date": datetime.date | None}
+
+    - ``orderable`` is True only when the size cell exists on the page AND
+      contains an enabled qty <input>.  It is False when the size isn't on
+      the grid, the cell has no input, or the input is disabled/readonly.
+    - ``restock_date`` is the parsed date from the tooltip's 'Restock Date'
+      row; None when no such row is visible (the item is in stock at this
+      size) OR when the lookup failed.
+
+    These two flags must be kept distinct: an earlier version returned
+    only the date, so "in-stock" and "unorderable at this size" both
+    collapsed to None — which caused pick_best_sku to swap to an
+    unorderable sub and abort the whole order via try_add_line's fatal
+    path.  Callers MUST check ``orderable`` before acting on the date.
+
+    Never raises on failure — a failed lookup must not abort the order.
+    """
+    info = {"orderable": False, "restock_date": None}
+
+    try:
+        driver.get(PRODUCT_MAP[sku]["url"])
+        time.sleep(0.4)
+    except Exception as e:
+        print(f"⚠️  read_restock_info: page load failed for {sku}: {e}")
+        return info
+
+    try:
+        located = _locate_qty_input_and_context(driver, sku, waist, inseam)
+    except UnorderableSizeError:
+        return info   # cell exists but has no qty input — not orderable
+    except Exception as e:
+        print(f"⚠️  read_restock_info: locate failed for {sku} {waist}x{inseam}: {e}")
+        return info
+    if not located:
+        return info   # size not found in grid — not orderable here
+
+    qty_input, context = located
+    # Disabled/readonly inputs are not orderable even though the cell exists.
+    try:
+        if qty_input.get_attribute("disabled") or qty_input.get_attribute("readonly"):
+            return info
+    except Exception:
+        pass
+    info["orderable"] = True
+
+    # Hover the cell to reveal the group-hover:flex tooltip inside it.
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", context)
+        ActionChains(driver).move_to_element(context).pause(0.25).perform()
+    except Exception as e:
+        print(f"⚠️  read_restock_info: hover failed for {sku} {waist}x{inseam}: {e}")
+        return info   # orderable=True, restock_date=None (unknown)
+
+    # Search the tooltip table for the 'Restock Date' row.  The tooltip lives
+    # inside the same cell; scope the XPath to that cell.
+    try:
+        label_td = WebDriverWait(driver, 2).until(
+            lambda d: context.find_element(
+                By.XPATH,
+                ".//td[normalize-space()='Restock Date']"
+            )
+        )
+    except TimeoutException:
+        # No Restock Date row → in-stock at this size.
+        return info
+    except Exception as e:
+        print(f"⚠️  read_restock_info: tooltip scan failed for {sku} {waist}x{inseam}: {e}")
+        return info
+
+    try:
+        value_td = label_td.find_element(By.XPATH, "following-sibling::td[1]")
+        raw = (value_td.text or "").strip()
+    except Exception as e:
+        print(f"⚠️  read_restock_info: value cell missing for {sku} {waist}x{inseam}: {e}")
+        return info
+
+    m = _RESTOCK_DATE_RE.search(raw)
+    if not m:
+        return info
+    token = m.group(1)
+    for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+        try:
+            info["restock_date"] = datetime.strptime(token, fmt).date()
+            return info
+        except ValueError:
+            continue
+    print(f"⚠️  read_restock_info: unparsable date '{raw}' for {sku} {waist}x{inseam}")
+    return info
+
+
+def pick_best_sku(driver, sku, waist, inseam):
+    """For PAIRABLE SKUs, return whichever of (sku, PAIRABLE[sku]) has the
+    sooner/in-stock availability for this specific (waist, inseam).
+
+    Orderability gates the decision — a swap to an UNORDERABLE sub would
+    cause try_add_line to return 'fatal_unorderable_size', which aborts
+    the entire order via clear_cart.  So if the sub cannot accept this
+    size (size missing from its grid, cell has no qty input, or input
+    disabled), we never swap to it regardless of dates.
+
+    Decision table (both orderable case):
+        original in-stock, sub in-stock   → original
+        original in-stock, sub dated      → original
+        original dated,    sub in-stock   → sub
+        both dated                         → earlier date wins; tie → original
+    Orderability rules:
+        alt not orderable                  → original
+        original not orderable, alt ok     → sub
+        neither orderable                  → original (caller will surface the failure)
+    Non-PAIRABLE SKUs are returned unchanged.
+    """
+    if sku not in PAIRABLE:
+        return sku
+    alt = PAIRABLE[sku]
+    if alt not in PRODUCT_MAP:
+        print(f"⚠️  pick_best_sku: sub '{alt}' for '{sku}' is not in PRODUCT_MAP — using original.")
+        return sku
+
+    orig_info = read_restock_info(driver, sku, waist, inseam)
+    alt_info  = read_restock_info(driver, alt, waist, inseam)
+
+    size_str = f"{waist}{('x'+str(inseam)) if inseam is not None else ''}"
+
+    def _fmt(info):
+        if not info["orderable"]:
+            return "unorderable"
+        d = info["restock_date"]
+        return d.strftime("%m/%d/%Y") if d else "in-stock"
+
+    # Orderability gate — this is what prevents swapping to a sub that
+    # doesn't support the requested size (e.g., MMS sizes stop at 42
+    # while MWZ goes to 54).
+    if not alt_info["orderable"] and orig_info["orderable"]:
+        chosen = sku
+    elif not orig_info["orderable"] and alt_info["orderable"]:
+        chosen = alt
+    elif not orig_info["orderable"] and not alt_info["orderable"]:
+        chosen = sku   # nothing we can do; let try_add_line report as-is
+    else:
+        # Both orderable → compare dates (None means in-stock here).
+        od = orig_info["restock_date"]
+        ad = alt_info["restock_date"]
+        if od is None and ad is None:
+            chosen = sku
+        elif od is None:
+            chosen = sku
+        elif ad is None:
+            chosen = alt
+        elif ad < od:
+            chosen = alt
+        else:
+            chosen = sku   # earlier or tied
+
+    if chosen == sku:
+        print(f"   · Pick: keeping {sku} {size_str} "
+              f"(orig={_fmt(orig_info)}, sub {alt}={_fmt(alt_info)})")
+    else:
+        print(f"   · Pick: switching {sku} → {alt} at {size_str} "
+              f"(orig={_fmt(orig_info)}, sub={_fmt(alt_info)})")
+    return chosen
+
+
+def _coerce_size_int(v):
+    """Return int for CSV size cells that look numeric, else None."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s in ("", "nan"):
+        return None
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return None
+
+
+def merge_pairable_duplicates(driver, df):
+    """Pre-pass for --prefer-sooner: collapse same-size rows of a PAIRABLE
+    pair into one combined line.
+
+    Rule: for every (pair, waist, inseam) bucket that contains rows with BOTH
+    SKUs of the pair present, sum their quantities and emit ONE row using the
+    SKU picked by pick_best_sku (sooner restock date).  Rows where only one
+    member of the pair appears at a given size are left alone — they still
+    go through per-line pick_best_sku in the main loop.  Duplicate rows of
+    the SAME SKU (no partner present) are untouched; preserving that avoids
+    surprising the caller with unexpected row combining.
+
+    Returns (df, prepicked_indices).  ``df`` has dropped the losing rows
+    (index NOT reset, so caller can keep iterating by original index).
+    ``prepicked_indices`` names rows whose SKU was decided here; the caller
+    should skip its own pick_best_sku for these.
+    """
+    prepicked = set()
+    if df.empty:
+        return df, prepicked
+
+    # Bucket rows by (pair_key, waist, inseam).  pair_key is a frozenset so
+    # it canonicalises either direction of the pair into the same bucket.
+    buckets = {}
+    for idx, row in df.iterrows():
+        sku = str(row.get("Item-Number", "")).strip()
+        if sku not in PAIRABLE:
+            continue
+        partner = PAIRABLE[sku]
+        pair_key = frozenset({sku, partner})
+        waist_key = _coerce_size_int(row.get("Size-1"))
+        inseam_key = _coerce_size_int(row.get("Size-2"))
+        buckets.setdefault((pair_key, waist_key, inseam_key), []).append(idx)
+
+    rows_to_drop = []
+    for (pair_key, waist_key, inseam_key), idxs in buckets.items():
+        skus_present = {str(df.at[i, "Item-Number"]).strip() for i in idxs}
+        # Only merge when BOTH SKUs of the pair actually appear.  Solo-pair
+        # rows and duplicate-same-SKU rows are handled elsewhere / untouched.
+        if len(skus_present) < 2:
+            continue
+
+        # Sum quantities per SKU for the log line, and overall for the winner.
+        per_sku_qty = {}
+        for i in idxs:
+            s = str(df.at[i, "Item-Number"]).strip()
+            q_raw = df.at[i, "Qty"]
+            q = int(float(q_raw)) if str(q_raw).strip() not in ("", "nan") else 0
+            per_sku_qty[s] = per_sku_qty.get(s, 0) + q
+        total_qty = sum(per_sku_qty.values())
+
+        # pick_best_sku only needs one side of the pair; it compares both.
+        try:
+            any_sku = next(iter(pair_key))
+            chosen = pick_best_sku(driver, any_sku, waist_key, inseam_key)
+        except Exception as e:
+            print(f"⚠️  merge pre-pass: pick_best_sku failed for pair {sorted(pair_key)} "
+                  f"at {waist_key}x{inseam_key}: {e} — leaving rows untouched.")
+            continue
+
+        # Prefer a winner row that already carries `chosen`; otherwise reuse
+        # the first index and rewrite its Item-Number.
+        winner_idx = next((i for i in idxs if str(df.at[i, "Item-Number"]).strip() == chosen),
+                         idxs[0])
+
+        df.at[winner_idx, "Item-Number"] = chosen
+        df.at[winner_idx, "Qty"]         = total_qty
+        prepicked.add(winner_idx)
+        for i in idxs:
+            if i != winner_idx:
+                rows_to_drop.append(i)
+
+        size_str = f"{waist_key}{'x'+str(inseam_key) if inseam_key is not None else ''}"
+        parts = ", ".join(f"{s} qty {q}" for s, q in per_sku_qty.items())
+        print(f"   · Merge pair @ {size_str}: {parts} → {chosen} qty {total_qty}")
+
+    if rows_to_drop:
+        df = df.drop(index=rows_to_drop)   # keep original index; caller relies on it
+    return df, prepicked
 
 
 # ─── SUMMARY / CART HELPERS ───────────────────────────────────────────────────
@@ -578,9 +867,16 @@ def process_backorder_csv(driver, csv_path):
     ship_zip       = df.iloc[0].get(_get_col(df, "ShipToZip",   "shipToZip",   "ShiptoZip",
                                               "ShipToPostalCode", "shipToPostalCode"), "")
 
+    # --prefer-sooner: collapse same-size rows of PAIRABLE pairs into one
+    # combined line BEFORE the add loop so both SKUs ship as a single cart
+    # line of the winner.
+    prepicked_indices = set()
+    if PREFER_SOONER_BO:
+        df, prepicked_indices = merge_pairable_duplicates(driver, df)
+
     # ── Add all lines (no substitution) ────────────────────────────────────
     add_failures = []
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
         sku     = str(row["Item-Number"]).strip()
         waist_v  = row.get("Size-1", "")
         inseam_v = row.get("Size-2", "")
@@ -592,6 +888,14 @@ def process_backorder_csv(driver, csv_path):
         if sku not in PRODUCT_MAP:
             print(f"⚠️  Unknown SKU '{sku}' in {os.path.basename(csv_path)} — skipping line.")
             continue
+
+        # --prefer-sooner: swap to the registered sub if it restocks earlier.
+        # Skip when the merge pre-pass already decided this row.
+        if PREFER_SOONER_BO and sku in PAIRABLE and idx not in prepicked_indices:
+            try:
+                sku = pick_best_sku(driver, sku, waist, inseam)
+            except Exception as e:
+                print(f"⚠️  pick_best_sku failed for {sku} {waist}x{inseam}: {e} — using original.")
 
         status, reason = try_add_line(driver, sku, waist, inseam, qty)
 
@@ -1078,4 +1382,21 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Place previously-skipped back-order orders from CSVs."
+    )
+    parser.add_argument(
+        "--prefer-sooner",
+        action="store_true",
+        help=(
+            "For SKUs that have a registered substitute in PAIRABLE, compare "
+            "the restock dates of the ordered item and its sub and place "
+            "whichever has the sooner (earlier) availability.  Without this "
+            "flag the script places items exactly as ordered."
+        ),
+    )
+    args = parser.parse_args()
+    PREFER_SOONER_BO = bool(args.prefer_sooner)
+    if PREFER_SOONER_BO:
+        print("🔀 Mode: --prefer-sooner (compare sub restock dates for PAIRABLE items)")
     main()

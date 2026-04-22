@@ -402,7 +402,23 @@ except Exception:  # pragma: no cover
     win32com = None  # type: ignore
 
 def ensure_processed_orders_closed_path(xlsx_path: str, log_fn):
-    """If the given Processed_orders.xlsx path is open in Excel, save and close it."""
+    """If the given Processed_orders.xlsx path is open in Excel, close it
+    WITHOUT saving.
+
+    Background: earlier versions of this function called ``wb.Save()`` before
+    closing, intending to preserve any unsaved Excel edits.  That silently
+    destroyed data in a very specific (and very common) scenario: a script
+    subprocess appends rows to Processed_orders.xlsx on disk while the user
+    still has the file open in Excel with its pre-subprocess view cached.
+    ``wb.Save()`` then writes Excel's stale in-memory view back to disk,
+    overwriting the rows the subprocess just wrote.  The whole reason this
+    function runs is that we're about to launch a subprocess that will
+    modify the same file — so Excel's view is about to be out of sync no
+    matter what.  Preferring on-disk data is the safer default.
+
+    Any unsaved edits the user had in Excel will be lost here.  We log
+    prominently so it's never a silent discard.
+    """
     if not xlsx_path or not os.path.isfile(xlsx_path):
         return
     if 'win32com' not in globals() or win32com is None:
@@ -420,12 +436,15 @@ def ensure_processed_orders_closed_path(xlsx_path: str, log_fn):
                 continue
             if os.path.abspath(xlsx_path).lower() == full.lower():
                 try:
-                    wb.Save()
-                except Exception:
-                    pass
-                try:
                     wb.Close(SaveChanges=False)
-                    log_fn("💾 Closed Processed_orders.xlsx before running step.")
+                    log_fn(
+                        "[WARN] Processed_orders.xlsx was open in Excel — "
+                        "closed WITHOUT saving Excel's view so on-disk rows "
+                        "from the previous step are preserved.  If you had "
+                        "unsaved manual edits in that workbook, they were "
+                        "discarded; close Excel before running steps to "
+                        "avoid this."
+                    )
                     try:
                         if xl.Workbooks.Count == 0:
                             xl.Quit()
@@ -1055,8 +1074,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Back Orders
         self.btn_open_skipped = self._btn("⚠   Skipped Orders.xlsx",       "util")
-        self.btn_backorders   = self._btn("♻  Place Back-Orders",           "step")
-        self.btn_backorders.setToolTip("Place previously skipped (back-order) orders, then enter PM numbers")
+        self.btn_backorders   = self._btn("♻  Place as ordered",            "step")
+        self.btn_backorders.setToolTip(
+            "Place previously skipped (back-order) orders exactly as ordered, "
+            "then enter PM numbers"
+        )
+        self.btn_backorders_sooner = self._btn("♻  Place soonest BO date",  "step")
+        self.btn_backorders_sooner.setToolTip(
+            "For PAIRABLE items, compare the restock date of the ordered SKU "
+            "against its registered sub and place whichever has the sooner "
+            "availability.  Runs the PM-numbers pipeline after."
+        )
         self.btn_wrg2         = self._btn("📦  Place Orders with Vendors",  "step")
 
         # Individual Steps
@@ -1141,7 +1169,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Back Orders (collapsible) ───────────────────────────────────────
         sidebar_layout.addWidget(_collapsible("Back Orders", [
-            self.btn_open_skipped, self.btn_backorders, self.btn_wrg2,
+            self.btn_open_skipped,
+            self.btn_backorders,
+            self.btn_backorders_sooner,
+            self.btn_wrg2,
         ]))
 
         # ── Individual Steps (collapsible) ──────────────────────────────────
@@ -1208,9 +1239,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_update_app.clicked.connect(self.update_app)
         self.btn_kill.clicked.connect(self.kill_current_task)
 
-        # Back Orders
+        # Back Orders — two modes: place as-ordered vs. pick sooner restock date
         self.btn_open_skipped.clicked.connect(self.open_skipped_orders)
-        self.btn_backorders.clicked.connect(self.run_backorders_then_pm)
+        self.btn_backorders.clicked.connect(
+            lambda _checked=False: self.run_backorders_then_pm()
+        )
+        self.btn_backorders_sooner.clicked.connect(
+            lambda _checked=False: self.run_backorders_then_pm(extra_args=["--prefer-sooner"])
+        )
         self.btn_wrg2.clicked.connect(self.run_orders_with_vendor)
 
         # Individual Steps
@@ -1474,7 +1510,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return env
 
     # --- Process execution helpers ---
-    def run_script(self, script_name: str, stdin_pipe: bool=False, label: str | None=None):
+    def run_script(self, script_name: str, stdin_pipe: bool=False, label: str | None=None,
+                   extra_args: list[str] | None = None):
         p = self.paths()
         ensure_processed_orders_closed_path(p["processed"], self.log)
         script_path = p["scripts"].get(script_name, script_name)
@@ -1482,10 +1519,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(f"[ERROR] Script not found: {script_path}")
             return None
         tag = label or os.path.basename(script_path)
+        if extra_args:
+            tag = f"{tag} {' '.join(extra_args)}"
         self.log(f"▶︎ Running {tag}…")
         env = os.environ.copy()
         env.update(self.profile_env())
-        worker = ProcWorker([PYTHON_EXE, script_path], cwd=p["ws"], stdin_pipe=stdin_pipe, env=env)
+        cmd = [PYTHON_EXE, script_path] + list(extra_args or [])
+        worker = ProcWorker(cmd, cwd=p["ws"], stdin_pipe=stdin_pipe, env=env)
         worker.line.connect(self.log)
         def _done(rc):
             self.log(f"◆ {tag} exited with code {rc}")
@@ -1819,13 +1859,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Keep enabled; many scripts pause multiple times per run.
 
     # --- Back-Orders + PM numbers pipeline ---
-    def run_backorders_then_pm(self):
+    def run_backorders_then_pm(self, extra_args: list[str] | None = None):
         if getattr(self, 'pipeline_active', False):
             self.log("[INFO] Another pipeline is already in progress.")
             return
         self.pipeline_active = True
         ensure_processed_orders_closed_path(self.paths()["processed"], self.log)
-        self.log("▶ Place Back-Orders starting…")
+        mode_tag = " (--prefer-sooner)" if extra_args and "--prefer-sooner" in extra_args else ""
+        self.log(f"▶ Place Back-Orders{mode_tag} starting…")
 
         def halt(step_name: str, rc: int):
             self.pipeline_active = False
@@ -1854,7 +1895,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 halt("Add_PM_Nums.py", 1)
 
         def start_backorders():
-            w = self.run_script("BroberryShop_Backorders.py", label="BroberryShop_Backorders.py")
+            w = self.run_script(
+                "BroberryShop_Backorders.py",
+                label="BroberryShop_Backorders.py",
+                extra_args=extra_args,
+            )
             if w:
                 w.finished.connect(lambda rc: after_backorders() if rc == 0 else halt("BroberryShop_Backorders.py", rc))
             else:
