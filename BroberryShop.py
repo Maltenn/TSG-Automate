@@ -918,10 +918,6 @@ def process_csv(driver, csv_path):
     )))
     driver.execute_script("arguments[0].click();", continue_btn)
 
-    # Fill shipper number on the shipping-and-payment page if needed
-    if shipper_number:
-        fill_shipper_number(driver, shipper_number)
-
     # Shipping method: try normal option first; if not available, fall back to UPS Ground (value=4 / id=4).
     try:
         ship_radio = WebDriverWait(driver, 2).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[name="order[shipping_id]"][value="1"]')))
@@ -932,6 +928,12 @@ def process_csv(driver, csv_path):
         except Exception:
             ship_radio = WebDriverWait(driver, 2).until(EC.element_to_be_clickable((By.ID, "4")))
         driver.execute_script("arguments[0].click();", ship_radio)
+
+    # Fill shipper number on the shipping-and-payment page if needed.
+    # Must happen AFTER the shipping radio click — the Shipper Number input is
+    # only revealed/interactable once the Wrangler - Shipper Account option is selected.
+    if shipper_number:
+        fill_shipper_number(driver, shipper_number)
     pay = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="order[payment_id]"][value="1"]')))
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pay)
     try:
