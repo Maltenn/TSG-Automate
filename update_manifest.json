@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "updated": "2026-04-24",
+  "updated": "2026-05-26",
   "files": [
     {
       "name": "tsg_automate_app.py",
@@ -20,7 +20,7 @@
     {
       "name": "BroberryShop.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/BroberryShop.py",
-      "sha256": "2487b41f2dc3d13cdc3cffb92109a1b8e0913e74528ba02d47f231989fc03308"
+      "sha256": "4227b069cb16c99338fa32d8502ca716bdc70949a1deb892367bcba62b2c78c7"
     },
     {
       "name": "BroberryShop_Backorders.py",

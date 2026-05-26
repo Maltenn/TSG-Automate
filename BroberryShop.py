@@ -96,32 +96,32 @@ ADDRESS_URL = "https://shop.broberry.com/shop/order/address"
 
 PRODUCT_MAP = {
     "3W045CH": {
-        "url": "https://shop.broberry.com/shop/product/1406495",
+        "url": "https://shop.broberry.com/shop/product/1462529",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42, 44, 46],
         "mode": "grid",
     },
     "3W045DK": {
-        "url": "https://shop.broberry.com/shop/product/1406722",
+        "url": "https://shop.broberry.com/shop/product/1462564",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42, 44, 46],
         "mode": "grid",
     },
     "3W060BR": {
-        "url": "https://shop.broberry.com/shop/product/1407233",
+        "url": "https://shop.broberry.com/shop/product/1462875",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62],
         "mode": "grid",
     },
     "10FR13MWZ": {
-        "url": "https://shop.broberry.com/shop/product/1392822",
+        "url": "https://shop.broberry.com/shop/product/1444629",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54],
         "mode": "auto",
     },
     "10FR13MMS": {
-        "url": "https://shop.broberry.com/shop/product/1392784",
+        "url": "https://shop.broberry.com/shop/product/1444608",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42],
         "mode": "auto",
     },
     "10FR47MLW": {
-        "url": "https://shop.broberry.com/shop/product/1393239",
+        "url": "https://shop.broberry.com/shop/product/1445120",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54],
         "mode": "auto",
     },
