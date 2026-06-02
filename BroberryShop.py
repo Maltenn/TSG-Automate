@@ -641,19 +641,17 @@ def clear_cart(driver):
             time.sleep(0.8)
     print("🧹 Cart cleared (order skipped).")
 
-def fill_address_and_notes(driver, po, notes,
+def fill_address_and_notes(driver, po, notes, account_email=None,
                            ship_company=None, ship_attention=None,
                            ship_street=None, ship_city=None, ship_state=None, ship_zip=None):
-    """Fill PO + notes, and (if provided) update the shipping address fields."""
+    """Fill PO + notes and the new-address shipping fields.
+
+    Billing section is left untouched (existing address default is kept).
+    For shipping, we switch to the 'I want to use a new address' option and
+    populate every field from scratch.
+    """
     wait = WebDriverWait(driver, 10)
     driver.get(ADDRESS_URL)
-
-    # Always fill PO into last-name slots
-    billing_ln  = wait.until(EC.element_to_be_clickable((By.ID, "billing-last-name")))
-    shipping_ln = wait.until(EC.element_to_be_clickable((By.ID, "shipping-last-name")))
-    for el in (billing_ln, shipping_ln):
-        el.clear()
-        el.send_keys(str(po))
 
     po_fld  = wait.until(EC.element_to_be_clickable((By.ID, "order-purchase-order")))
     po_fld.clear()
@@ -664,13 +662,22 @@ def fill_address_and_notes(driver, po, notes,
     if notes:
         notes_f.send_keys("\n".join(notes))
 
+    # Switch shipping section to "I want to use a new address"
+    new_addr_radio = wait.until(EC.presence_of_element_located((
+        By.CSS_SELECTOR, 'input[name="user_address[shipping][select_address]"][value="newAddressShipping"]'
+    )))
+    driver.execute_script("arguments[0].click();", new_addr_radio)
+
+    # Wait for the new-address shipping panel to become visible (required attrs appear on first-name)
+    wait.until(EC.visibility_of_element_located((By.ID, "shipping-first-name")))
+
     def _norm(v):
         if v is None:
             return ""
         s = str(v).strip()
         return "" if (not s or s.lower() == "nan") else s
 
-    # Company line: no connector, just a single space
+    # Company line: ship_company + ship_attention combined (carries the real customer name)
     company_line_parts = [p for p in (_norm(ship_company), _norm(ship_attention)) if p]
     company_line = " ".join(company_line_parts).strip()
 
@@ -680,14 +687,24 @@ def fill_address_and_notes(driver, po, notes,
         except Exception:
             return None
 
-    comp_el = _get_by_id("shipping-company", timeout=2)
-    addr_el = _get_by_id("shipping-address-1", timeout=2)
-    city_el = _get_by_id("shipping-city", timeout=2)
-    zip_el  = _get_by_id("shipping-postal-code", timeout=2)
-    st_el   = _get_by_id("shipping-state", timeout=2)
+    email_el = _get_by_id("shipping-email-address", timeout=2)
+    comp_el  = _get_by_id("shipping-company", timeout=2)
+    fn_el    = _get_by_id("shipping-first-name", timeout=2)
+    ln_el    = _get_by_id("shipping-last-name", timeout=2)
+    addr_el  = _get_by_id("shipping-address-1", timeout=2)
+    city_el  = _get_by_id("shipping-city", timeout=2)
+    zip_el   = _get_by_id("shipping-postal-code", timeout=2)
+    st_el    = _get_by_id("shipping-state", timeout=2)
+    phone_el = _get_by_id("shipping-phone-no", timeout=2)
 
+    if email_el and _norm(account_email):
+        email_el.clear(); email_el.send_keys(_norm(account_email))
     if comp_el and company_line:
         comp_el.clear(); comp_el.send_keys(company_line)
+    if fn_el:
+        fn_el.clear(); fn_el.send_keys(str(po))
+    if ln_el:
+        ln_el.clear(); ln_el.send_keys(str(po))
     if addr_el and _norm(ship_street):
         addr_el.clear(); addr_el.send_keys(_norm(ship_street))
     if city_el and _norm(ship_city):
@@ -700,6 +717,8 @@ def fill_address_and_notes(driver, po, notes,
         driver.execute_script("arguments[0].focus();", zip_el)
         zip_el.send_keys(Keys.CONTROL, "a")
         zip_el.send_keys(_norm(ship_zip))
+    if phone_el:
+        phone_el.clear(); phone_el.send_keys("407.682.1400")
 
     if st_el and _norm(ship_state):
         state_in = _norm(ship_state).upper()
@@ -760,7 +779,7 @@ def submit_order(driver):
         print("⚠️  Submitted click issued, but confirmation not detected. Proceeding.")
 time.sleep(1)
 
-def process_csv(driver, csv_path):
+def process_csv(driver, csv_path, account_email=None):
     print(f"\n=== Processing {os.path.basename(csv_path)} ===")
     df = pd.read_csv(csv_path)
     
@@ -909,7 +928,8 @@ def process_csv(driver, csv_path):
 
     # Go to checkout/address page directly (more reliable than clicking a button
     # whose text/classes can change).
-    fill_address_and_notes(driver, po_number, notes, ship_company, ship_attention, 
+    fill_address_and_notes(driver, po_number, notes, account_email,
+                          ship_company, ship_attention,
                           ship_street, ship_city, ship_state, ship_zip)
 
     wait = WebDriverWait(driver, 10)
@@ -990,7 +1010,7 @@ def main():
                 print(f"→ New session for account {current_account}")
 
             print(f"→ Using account {current_account} for {os.path.basename(csv_path)}")
-            process_csv(driver, csv_path)
+            process_csv(driver, csv_path, account_email=current_account)
 
     finally:
         if driver:
