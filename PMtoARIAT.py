@@ -1,16 +1,33 @@
 import os
 import re
+import sys
 import glob
 import time
 import math
 import pandas as pd
+
+# Make stdout/stderr robust to non-UTF-8 consoles (e.g. Windows cp1252 when this
+# script is launched standalone or with its output redirected).  Without this a
+# print() containing a non-cp1252 character raised UnicodeEncodeError and killed
+# the whole run.  The GUI app already forces PYTHONUTF8=1, but standalone runs
+# (double-click, console, redirected logs) did not — making the script appear to
+# "fail randomly" depending on how it was launched.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
+from selenium.common.exceptions import (
+    TimeoutException,
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+)
 from selenium.webdriver.common.action_chains import ActionChains
 
 
@@ -115,7 +132,7 @@ def wait_ready(driver, timeout=WAIT_MED):
 def safe_click(driver, el):
     try:
         el.click()
-    except ElementClickInterceptedException:
+    except (ElementClickInterceptedException, ElementNotInteractableException):
         driver.execute_script("arguments[0].click();", el)
 
 
@@ -148,40 +165,51 @@ def click_dijit_button_by_label(driver, label_text: str, timeout=WAIT_LONG, pref
     """
     label_text = str(label_text).strip()
 
-    # 1) Prefer stable ID when we have one
+    def _visible(el):
+        try:
+            return el.is_displayed()
+        except Exception:
+            return False
+
+    def _click_btn_for_label_span(span):
+        try:
+            btn = span.find_element(By.XPATH, "./ancestor::*[@role='button'][1]")
+        except Exception:
+            btn = span.find_element(By.XPATH, "./ancestor::*[contains(@class,'dijitButtonNode')][1]")
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        safe_click(driver, btn)
+        return btn
+
+    # 1) Prefer the stable ID — but ONLY when it is actually visible.  Dojo
+    #    regenerates the numeric widget-id suffix and often keeps a hidden
+    #    duplicate (e.g. a collapsed form's Save), so a hardcoded id like
+    #    'dijit_form_Button_40' frequently points at a hidden/stale button.
     if prefer_id:
         try:
             el = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.ID, prefer_id)))
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            safe_click(driver, el)
-            return el
+            if _visible(el):
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                safe_click(driver, el)
+                return el
         except Exception:
             pass
 
-        # Also try label id pattern (e.g. dijit_form_Button_40_label)
-        try:
-            el = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.ID, f"{prefer_id}_label")))
-            # climb to clickable button area
-            btn = el.find_element(By.XPATH, "./ancestor::*[@role='button'][1] | ./ancestor::*[contains(@class,'dijitButtonNode')][1]")
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            safe_click(driver, btn)
-            return btn
-        except Exception:
-            pass
-
-    # 2) Find by visible label and click the correct ancestor
+    # 2) Find by label, preferring the VISIBLE button instance.
     xpath_label = f"//span[contains(@class,'dijitButtonText') and normalize-space()='{label_text}']"
-    label_span = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, xpath_label)))
+    WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, xpath_label)))
+    spans = driver.find_elements(By.XPATH, xpath_label)
+    spans = sorted(spans, key=lambda s: 0 if _visible(s) else 1)  # visible first
 
-    # Prefer role=button node or dijitButtonNode container
-    try:
-        btn = label_span.find_element(By.XPATH, "./ancestor::*[@role='button'][1]")
-    except Exception:
-        btn = label_span.find_element(By.XPATH, "./ancestor::*[contains(@class,'dijitButtonNode')][1]")
-
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-    safe_click(driver, btn)
-    return btn
+    last_err = None
+    for span in spans:
+        try:
+            return _click_btn_for_label_span(span)
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    raise TimeoutException(f"Could not click a dijit button labelled '{label_text}'.")
 
 
 # ─── DOJO MAIN MENU (CRITICAL) ──────────────────────────────────────────────
@@ -860,6 +888,139 @@ def load_shipto_from_po_csv(po_number: str) -> dict:
     )
 
 
+def _shell_is_ready(driver) -> bool:
+    """True once the Dojo order-builder shell is present (the Menu widget).
+
+    Detected via the stable '.mainMenu' class rather than the auto-incrementing
+    dijit widget id — Dojo regenerates the numeric suffix on re-render.
+    """
+    try:
+        return any(e.is_displayed() for e in driver.find_elements(By.CSS_SELECTOR, "div.mainMenu"))
+    except Exception:
+        return False
+
+
+def _on_catalog_list(driver) -> bool:
+    """True when we've reached the catalog-selection list (post 'Shop Now')."""
+    try:
+        if "cataloglist" in (driver.current_url or "").lower():
+            return True
+        return bool(driver.find_elements(By.CSS_SELECTOR, "[data-testid^='card-carousel-image']"))
+    except Exception:
+        return False
+
+
+def _click_shop_now(driver, timeout=60) -> bool:
+    """Click the post-login 'Shop Now' button reliably.
+
+    The marketing landing page renders 'Shop Now' as a <button> gated by a
+    '.not-allowed-wrapper' overlay until catalog data loads, so it is NOT
+    immediately interactable after login.  The old one-shot 15s attempt missed
+    it on slow loads.  Here we poll for it (up to `timeout`s), JS-click it
+    (bypasses the overlay), and confirm we advanced to the catalog list.
+    Returns True once we've advanced past the marketing page.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        if _shell_is_ready(driver) or _on_catalog_list(driver):
+            return True
+
+        btn = None
+        for e in driver.find_elements(By.XPATH, "//button[normalize-space()='Shop Now']"):
+            try:
+                if e.is_displayed():
+                    btn = e
+                    break
+            except Exception:
+                continue
+
+        if btn is not None:
+            try:
+                driver.execute_script("arguments[0].click();", btn)
+                print("[INFO] Clicked 'Shop Now'")
+            except Exception as e:
+                print(f"[WARN] 'Shop Now' click raised: {e}")
+            # Wait briefly for the click to register / page to advance
+            adv_end = time.time() + 8
+            while time.time() < adv_end:
+                if _shell_is_ready(driver) or _on_catalog_list(driver):
+                    return True
+                time.sleep(0.4)
+        else:
+            print("[INFO] 'Shop Now' not present yet — waiting for marketing page to render...")
+        time.sleep(0.8)
+
+    return _shell_is_ready(driver) or _on_catalog_list(driver)
+
+
+def _click_catalog_tile(driver, timeout=30) -> bool:
+    """Click the first catalog tile on the catalog-list view to enter the
+    order builder.  Tries several selectors and re-checks shell readiness."""
+    selectors = [
+        "[data-testid='card-carousel-image-0']",
+        "[data-testid^='card-carousel-image']",
+        ".slick-slide.slick-current",
+        ".slick-slide",
+    ]
+    end = time.time() + timeout
+    while time.time() < end:
+        if _shell_is_ready(driver):
+            return True
+        clicked = False
+        for sel in selectors:
+            for e in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if e.is_displayed():
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", e)
+                        driver.execute_script("arguments[0].click();", e)
+                        print(f"[INFO] Clicked catalog tile ({sel})")
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if clicked:
+                break
+        # Give the navigation up to 5s to bring up the Dojo shell, else retry
+        wait_end = time.time() + 5
+        while time.time() < wait_end:
+            if _shell_is_ready(driver):
+                return True
+            time.sleep(0.4)
+        time.sleep(0.5)
+    return _shell_is_ready(driver)
+
+
+def enter_order_builder(driver, timeout=WAIT_LONG):
+    """Drive the post-login  marketing -> catalog -> Dojo order-builder  hops.
+
+    This sequence is the historical cause of the 'works less than it works'
+    flakiness.  The old code fired a single 15s 'Shop Now' click immediately
+    after login and, if the page had not finished rendering, silently fell
+    through and then waited (in vain) for the Dojo menu that only exists once
+    the order builder loads.  We now poll/verify each hop instead.
+    """
+    if _shell_is_ready(driver):
+        print("[INFO] Order-builder shell already present.")
+        return
+
+    if not _click_shop_now(driver, timeout=max(timeout, 60)):
+        print("[WARN] Could not confirm 'Shop Now'/catalog list — continuing to look for shell anyway.")
+    _click_catalog_tile(driver, timeout=30)
+
+    # Wait for the Dojo order-builder shell (Menu widget) — resilient to the
+    # auto-incrementing dijit id; match on the stable '.mainMenu' class.
+    print("[INFO] Waiting for Dojo order-builder shell (.mainMenu)...")
+    end = time.time() + max(timeout, 60)
+    while time.time() < end:
+        if _shell_is_ready(driver):
+            print("[INFO] Order-builder shell is ready.")
+            return
+        time.sleep(0.5)
+    raise TimeoutException(
+        f"Order-builder shell (.mainMenu) never appeared. URL={driver.current_url}"
+    )
+
+
 def login_and_land(driver):
     wait = WebDriverWait(driver, WAIT_LONG)
     driver.get(ARIAT_URL)
@@ -875,29 +1036,12 @@ def login_and_land(driver):
 
     click_button_by_text(driver, "Login", timeout=WAIT_LONG)
 
-    # "Shop Now" only appears on certain landing/marketing pages — skip if absent.
-    try:
-        click_button_by_text(driver, "Shop Now", timeout=15)
-        print("[INFO] Clicked 'Shop Now' landing button")
-    except TimeoutException:
-        print("[INFO] 'Shop Now' not found — assuming direct app landing, continuing")
+    # Drive the post-login  marketing -> catalog -> Dojo order-builder  transition
+    # robustly.  (This hop was the historical cause of the intermittent failures:
+    # a slow marketing page meant 'Shop Now' wasn't clicked within the old 15s
+    # window, so the app shell never loaded and the menu wait timed out.)
+    enter_order_builder(driver, timeout=WAIT_LONG)
 
-    # Some accounts land on a brand/category carousel; click the first tile if present.
-    try:
-        wait_and_click(driver, By.CSS_SELECTOR, "[data-testid='card-carousel-image-0']", timeout=15)
-        print("[INFO] Clicked carousel image-0")
-    except TimeoutException:
-        try:
-            wait_and_click(driver, By.CSS_SELECTOR, ".slick-slide.slick-current", timeout=10)
-            print("[INFO] Clicked slick carousel slide")
-        except TimeoutException:
-            print("[INFO] No carousel tile found — skipping")
-
-    # Wait until the Dojo app shell is fully rendered (main menu trigger present).
-    print("[INFO] Waiting for Dojo main menu trigger to appear...")
-    WebDriverWait(driver, WAIT_LONG).until(
-        EC.presence_of_element_located((By.ID, MAIN_MENU_TRIGGER_ID))
-    )
     wait_ready(driver)
     time.sleep(1.5)   # let Dojo finish widget registration before we interact
 
@@ -927,7 +1071,65 @@ def import_file_flow(driver, upload_path: str):
     click_button_by_text(driver, "Next", timeout=WAIT_LONG)
 
 
+# ─── SALES-PROGRAMS UPSELL MODAL ─────────────────────────────────────────────
+# After 'Proceed to Checkout' on the cart page, Ariat sometimes pops a React
+# 'Apply Sales Programs' modal (a volume-discount upsell).  It appears for some
+# carts and not others depending on the items/quantities — which is exactly why
+# the script "worked less than it worked": orders that triggered the modal hung
+# at checkout (the modal blocked the drop-ship button), while orders that did
+# not sailed through.  We dismiss it by clicking its 'Proceed' button, which
+# continues at standard pricing with no program applied (the historical, money-
+# neutral behaviour for this unattended automation).  The button classes are
+# hashed styled-components, so we match on the modal text + button text.
+_SALES_MODAL_XPATH = (
+    "//div[contains(@class,'ReactModal__Content')]"
+    "[.//*[normalize-space()='Apply Sales Programs']]"
+)
+
+
+def _sales_programs_modal_present(driver) -> bool:
+    try:
+        return any(e.is_displayed() for e in driver.find_elements(By.XPATH, _SALES_MODAL_XPATH))
+    except Exception:
+        return False
+
+
+def _dismiss_sales_programs_modal(driver, timeout=WAIT_SHORT) -> bool:
+    """If the 'Apply Sales Programs' upsell modal is showing, click its
+    'Proceed' button (continue without applying a program).  Returns True if a
+    modal was dismissed."""
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.visibility_of_element_located((By.XPATH, _SALES_MODAL_XPATH))
+        )
+    except TimeoutException:
+        return False
+
+    print("[INFO] 'Apply Sales Programs' modal detected — proceeding without applying a program.")
+    for xp in (
+        _SALES_MODAL_XPATH + "//button[normalize-space()='Proceed']",
+        "//div[contains(@class,'ReactModal__Content')]//button[normalize-space()='Proceed']",
+    ):
+        try:
+            btn = WebDriverWait(driver, WAIT_SHORT).until(EC.element_to_be_clickable((By.XPATH, xp)))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            safe_click(driver, btn)
+            print("[INFO] Clicked 'Proceed' on the Sales Programs modal.")
+            try:
+                WebDriverWait(driver, WAIT_MED).until(
+                    EC.invisibility_of_element_located((By.XPATH, _SALES_MODAL_XPATH))
+                )
+            except TimeoutException:
+                pass
+            return True
+        except TimeoutException:
+            continue
+    print("[WARN] Sales Programs modal present but its 'Proceed' button was not clickable.")
+    return False
+
+
 def proceed_to_checkout_flow(driver):
+    # Step 1: 'Proceed to Checkout' on the order page (Dojo proceedBtn) -> cart.
     try:
         wait_and_click(
             driver,
@@ -938,14 +1140,37 @@ def proceed_to_checkout_flow(driver):
     except TimeoutException:
         wait_and_click(driver, By.XPATH, "//*[normalize-space()='Proceed to Checkout']", timeout=WAIT_LONG)
 
-    for _ in range(2):
+    # Step 2: 'Proceed to Checkout' on the cart page (React button) -> this is
+    # what opens the optional Sales Programs modal.  Stop clicking as soon as the
+    # modal appears or we've already reached shipping (drop-ship button present).
+    for _ in range(3):
+        if _sales_programs_modal_present(driver) or driver.find_elements(By.CSS_SELECTOR, "span.btnDropShip"):
+            break
         try:
             click_button_by_text(driver, "Proceed to Checkout", timeout=WAIT_MED)
         except TimeoutException:
             pass
-    time.sleep (1.1)
-    WebDriverWait(driver, WAIT_LONG).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "span.btnDropShip"))
+        time.sleep(1.0)
+
+    # Steps 3+4: dismiss the optional modal, then confirm we've advanced to the
+    # shipping step.  Loop because the exact ordering varies: keep dismissing the
+    # modal / re-clicking Proceed until the drop-ship button is present.
+    end = time.time() + WAIT_LONG
+    while time.time() < end:
+        if driver.find_elements(By.CSS_SELECTOR, "span.btnDropShip"):
+            return
+        if _sales_programs_modal_present(driver):
+            _dismiss_sales_programs_modal(driver, timeout=WAIT_SHORT)
+        else:
+            try:
+                click_button_by_text(driver, "Proceed to Checkout", timeout=3)
+            except TimeoutException:
+                pass
+        time.sleep(1.0)
+
+    raise TimeoutException(
+        "span.btnDropShip never appeared after Proceed-to-Checkout / Sales-Programs handling. "
+        f"URL={driver.current_url}"
     )
 
 

@@ -189,6 +189,30 @@ def filter_address_chars(text: str) -> str:
     return filtered.strip()
 
 
+# Matches the retailer name "Walmart" and its common variants (Wal-Mart, Wal Mart,
+# Walmart.com) as a whole word, case-insensitively.
+_WALMART_RE = re.compile(r"\bwal[\s.\-]?mart\b(?:\.com)?", re.I)
+
+
+def scrub_walmart(text: str) -> str:
+    """
+    Strip the word "Walmart" (any case/variant) out of a Ship To text value.
+
+    These drop-ship POs list "WALMART." as the company line with the real recipient on
+    the line below it. We never want "Walmart" in the name/company/attention output, so
+    this removes the word and tidies up any separator/punctuation left dangling
+    (e.g. "WALMART." -> "", "WALMART STORE 12" -> "STORE 12").
+
+    No-op when the text doesn't contain "Walmart", so non-Walmart POs are untouched.
+    """
+    if not text or not _WALMART_RE.search(text):
+        return text
+    cleaned = _WALMART_RE.sub(" ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Trim separators left dangling after removal (leading/trailing ". , | -")
+    return cleaned.strip(" .,|-").strip()
+
+
 def _is_ship_to_junk_line(s: str) -> bool:
     """Filter out carrier/service/tracking artifacts that sometimes bleed into the Ship To block."""
     t = s.strip()
@@ -617,6 +641,16 @@ def process_file(pdf_path: Path, out_dir: Path) -> bool:
     email = extract_contact_email(lines)
 
     ship_to_lines = extract_ship_to_lines(pdf_path, lines)
+
+    # Scrub the retailer name "Walmart" out of every Ship To line up front. Drop any line
+    # that becomes empty (e.g. a standalone "WALMART." company line). Because the parser
+    # treats the first line as shipToCompany -- the column that must always carry the
+    # recipient name -- dropping the "WALMART." line lets the real recipient below it flow
+    # up into shipToCompany instead of being stranded in shipToAttention. This single point
+    # feeds both Column C (shipTo) and parse_ship_to_fields, so "Walmart" never reaches the
+    # name/company/attention output.
+    ship_to_lines = [s for s in (scrub_walmart(l) for l in ship_to_lines) if s]
+
     ship_to = " | ".join(ship_to_lines) if ship_to_lines else ""
 
     # Ensure Column C ends with: "FedEx Ground: 955617339" (stationary)

@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "updated": "2026-06-02",
+  "updated": "2026-06-17",
   "files": [
     {
       "name": "tsg_automate_app.py",
@@ -15,7 +15,7 @@
     {
       "name": "PDFExtract.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PDFExtract.py",
-      "sha256": "0a272c96ac18a66d7420a2466cf28f4ec9eaaabfc3ab33218aabd9dea6450fa3"
+      "sha256": "9a021e6873a65d13c93287a4f47cc07114fb3f2df06fc356f87c4e4219a0eda9"
     },
     {
       "name": "BroberryShop.py",
@@ -45,7 +45,7 @@
     {
       "name": "PMtoARIAT.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoARIAT.py",
-      "sha256": "a01693b0820974a2eaa2485c863fc9cc5732e8eb39a2d1fd64c0ae1198ede1f8"
+      "sha256": "110f297b54f3a747a16ae8771573956615e5a78c44fb61fa148201592d045fa0"
     },
     {
       "name": "PMtoPropper.py",
