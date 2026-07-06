@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "updated": "2026-06-17",
+  "updated": "2026-07-06",
   "files": [
     {
       "name": "tsg_automate_app.py",
@@ -15,7 +15,7 @@
     {
       "name": "PDFExtract.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PDFExtract.py",
-      "sha256": "9a021e6873a65d13c93287a4f47cc07114fb3f2df06fc356f87c4e4219a0eda9"
+      "sha256": "b7a5ea59af90fda499f1c60c31fbd77f0c9982d17d69a71fe6edc0ff119f29bd"
     },
     {
       "name": "BroberryShop.py",

@@ -37,6 +37,12 @@ ALPHA_SIZES = {
     "REG", "TALL", "LONG", "SHORT"
 }
 
+# Single-letter length codes used on women's items (e.g. "- 8 R" = size 8 Regular).
+# Kept separate from ALPHA_SIZES: only the dash-pattern branch in find_sizes should
+# accept bare "R"/"U", otherwise the loose alpha-token fallback would pick up stray
+# letters from description text.
+LENGTH_LETTERS = {"S", "R", "L", "U"}
+
 FOOTER_RE = re.compile(r"^(Subtotal|Total|Shipping|Sales\s+Tax|Authorized By:|Report Date:|Page\s+#)", re.I)
 
 # Stationary carrier text to append to the end of Column C (shipTo)
@@ -542,9 +548,10 @@ def find_sizes(main_line: str, cont_lines, pid=""):
     if m:
         return [m.group(1), m.group(2)]
 
-    # "- 14 L" style: numeric size (any width) + alpha inseam/length (e.g. women's sizes)
+    # "- 14 L" / "- 8 R" style: numeric size (any width) + alpha inseam/length
+    # (e.g. women's sizes with Short/Regular/Long/Unhemmed letters)
     m = re.search(r"-\s*(\d{1,3})\s+([A-Z]{1,4})\b", text, re.I)
-    if m and m.group(2).upper() in ALPHA_SIZES:
+    if m and m.group(2).upper() in (ALPHA_SIZES | LENGTH_LETTERS):
         return [m.group(1), m.group(2).upper()]
 
     # Integer tokens not adjacent to '.' so we don't split decimals like 40.28 into 40 and 28
