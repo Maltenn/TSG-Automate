@@ -13,6 +13,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 from openpyxl import load_workbook
+from openpyxl.styles import Font
 
 # --------------------------------------------------------------------
 # Environment-driven settings (provided by the controller app)
@@ -315,7 +316,11 @@ def write_to_excel(template_path, output_path, records):
     wb = load_workbook(template_path)
     ws = wb.active
     headers = [cell.value for cell in ws[1]]
-    today = datetime.now().strftime("%m/%d/%Y")
+    now = datetime.now()
+    today = f"{now.month}.{now.day}.{now:%y}"   # e.g. 8.6.26
+    # Style the WHOLE row: the template's default font is the Office theme
+    # font (Aptos Narrow 11), so unstyled cells would not match Arial 10.
+    row_font = Font(name="Arial", size=10)
 
     for rec in records:
         # Don't write rows for orders that were skipped by BroberryShop
@@ -341,6 +346,8 @@ def write_to_excel(template_path, output_path, records):
             "Freight (CC or N30)": "Cust Acct"
         }
         ws.append([row_map.get(h, "") for h in headers])
+        for c in range(1, len(headers) + 1):
+            ws.cell(row=ws.max_row, column=c).font = row_font
 
     wb.save(output_path)
 

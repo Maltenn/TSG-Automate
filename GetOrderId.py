@@ -5,6 +5,8 @@ import time
 import datetime
 import pandas as pd
 
+from openpyxl import load_workbook
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -97,17 +99,36 @@ def main():
     print("="*60)
     print("")
     
+    # Load the Excel FIRST so we can skip the Wrangler login entirely when
+    # this batch contains no Wrangler orders (e.g. Ariat/Propper-only runs).
+    print("[INFO] Loading Excel file...")
+    df = pd.read_excel(EXCEL_PATH, engine="openpyxl", dtype=str)
+    col_g = df.columns[6]   # PO column
+    col_k = df.columns[10]  # Vendor column
+
+    wrangler_rows = []
+    for idx, po in enumerate(df[col_g]):
+        if not po or pd.isna(po):
+            continue
+        vendor_cell = str(df.at[idx, col_k]) if not pd.isna(df.at[idx, col_k]) else ""
+        if "wrangler" in vendor_cell.lower():
+            wrangler_rows.append((idx, po))
+        else:
+            print(f"[{idx+1}/{len(df)}] Skipping PO {po} — vendor '{vendor_cell}' does not include Wrangler")
+
+    if not wrangler_rows:
+        print("")
+        print("[INFO] No Wrangler orders found in Processed_orders.xlsx (column K).")
+        print("[INFO] Nothing to fetch — skipping Wrangler login.")
+        return
+
     driver = webdriver.Chrome()
     try:
         print("[INFO] Logging in to Wrangler B2B...")
         login(driver)
         print("[OK] Login successful!")
         print("")
-        
-        print("[INFO] Loading Excel file...")
-        df = pd.read_excel(EXCEL_PATH, engine="openpyxl", dtype=str)
-        col_g = df.columns[6]  # PO column
-        
+
         # Go to order history once
         print("[INFO] Navigating to Order History...")
         driver.get(ORDER_HISTORY_URL)
@@ -116,50 +137,44 @@ def main():
         )
         print("[OK] Order History page loaded")
         print("")
-        
-        # Ensure "Order ID" column exists
-        if 'Order ID' not in df.columns:
-            print("[INFO] Creating 'Order ID' column...")
-            df.insert(12, 'Order ID', '')
-        
+
         print("="*60)
-        print(f"[INFO] Fetching Order IDs for {len(df)} orders")
+        print(f"[INFO] Fetching Order IDs for {len(wrangler_rows)} Wrangler orders")
         print("="*60)
         print("")
-        
-        # Loop through all POs
+
+        # Loop through the Wrangler POs
         success_count = 0
         fail_count = 0
-        
-        col_k = df.columns[10]  # Vendor column
+        found = {}   # df row index -> order id
 
-        for idx, po in enumerate(df[col_g]):
-            if not po or pd.isna(po):
-                continue
-
-            # Only process rows where column K contains "wrangler" (case-insensitive)
-            vendor_cell = str(df.at[idx, col_k]) if not pd.isna(df.at[idx, col_k]) else ""
-            if "wrangler" not in vendor_cell.lower():
-                print(f"[{idx+1}/{len(df)}] Skipping PO {po} — vendor '{vendor_cell}' does not include Wrangler")
-                print("")
-                continue
-
+        for idx, po in wrangler_rows:
             print(f"[{idx+1}/{len(df)}] Looking up Order ID for PO: {po}")
             oid = find_order_id_for_po(driver, po)
-            
+
             if oid:
-                df.at[idx, 'Order ID'] = oid
+                found[idx] = oid
                 success_count += 1
                 print(f"[OK] PO {po} → Order ID: {oid}")
             else:
                 fail_count += 1
                 print(f"[WARNING] Order ID not found for PO {po}")
             print("")
-        
-        # Save results
+
+        # Save results with targeted openpyxl writes so the rest of the
+        # workbook (values, fonts, date formatting) is left untouched.
         print("="*60)
         print("[INFO] Saving results to Excel...")
-        df.to_excel(EXCEL_PATH, index=False)
+        wb = load_workbook(EXCEL_PATH)
+        ws = wb.active
+        headers = [c.value for c in ws[1]]
+        if "Order ID" in headers:
+            oid_col = headers.index("Order ID") + 1
+        else:
+            oid_col = 13  # column M ("Order Number in vendor system")
+        for idx, oid in found.items():
+            ws.cell(row=idx + 2, column=oid_col).value = oid  # +2: header row + 1-based
+        wb.save(EXCEL_PATH)
         print(f"[OK] Saved updated Order IDs to {EXCEL_PATH}")
         print("="*60)
         print("")

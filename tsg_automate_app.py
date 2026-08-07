@@ -890,6 +890,14 @@ class ProcWorker(QtCore.QThread):
             except Exception as e:
                 self.line.emit(f"[ERROR] Failed to send Enter: {e}")
 
+    def send_line(self, text: str):
+        if self.proc and self.proc.stdin:
+            try:
+                self.proc.stdin.write(text.rstrip('\n') + '\n')
+                self.proc.stdin.flush()
+            except Exception as e:
+                self.line.emit(f"[ERROR] Failed to send input: {e}")
+
     def is_running(self) -> bool:
         try:
             return self.proc is not None and self.proc.poll() is None
@@ -1527,6 +1535,9 @@ class MainWindow(QtWidgets.QMainWindow):
         cmd = [PYTHON_EXE, script_path] + list(extra_args or [])
         worker = ProcWorker(cmd, cwd=p["ws"], stdin_pipe=stdin_pipe, env=env)
         worker.line.connect(self.log)
+        # Bound-method connection → queued onto the GUI thread; the slot uses
+        # self.sender() to reply to the right worker's stdin.
+        worker.line.connect(self._on_script_prompt_line)
         def _done(rc):
             self.log(f"◆ {tag} exited with code {rc}")
             if worker is self.running.pm_to_wrg:
@@ -1593,11 +1604,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         threading.Thread(target=_wait_then_merge, daemon=True).start()
 
-    # --- Extract PDF (clears Excel first) ---
+    # --- Extract PDF (standalone button) ---
     def run_extract_pdf(self):
+        """Regenerate pdfs/*.csv from the PDFs in the pdfs folder.
+
+        Deliberately does NOT clear Processed_orders.xlsx: PDFExtract.py only
+        writes CSVs, and keeping the workbook intact makes this button safe
+        for regenerating a missing address CSV mid-run (PM numbers in column
+        G survive). The full pipelines (Run to PM / Run All Steps) still
+        clear the workbook at their own start.
+        """
         p = self.paths()
         ensure_processed_orders_closed_path(p["processed"], self.log)
-        clear_processed_orders(p["ws"], self.log)
         self.run_script("PDFExtract.py")
 
     # --- Wrangler flow ---
@@ -1745,7 +1763,17 @@ class MainWindow(QtWidgets.QMainWindow):
             steps.append(("Propper", "PMtoPropper.py"))
 
         def run_get_order_ids_then_finish():
-            """After all vendor scripts finish, run GetOrderId, then purge old files."""
+            """After all vendor scripts finish, run GetOrderId (Wrangler-only
+            lookup — skipped when no Wrangler orders were placed), then purge
+            old files."""
+            if not has_wrg:
+                self.log("[INFO] No Wrangler orders in this batch — skipping Get Order IDs.")
+                purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
+                self.log("◆ Place Orders with Vendor complete.")
+                if on_complete:
+                    on_complete(0)
+                return
+
             self.log("▶ Starting Get Order IDs…")
             ensure_processed_orders_closed_path(processed_path, self.log)
             worker = self.run_script("GetOrderId.py", stdin_pipe=True, label="GetOrderId.py")
@@ -1857,6 +1885,105 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log('✅ Sent Enter to the running script ("Verification Complete").')
 
         # Keep enabled; many scripts pause multiple times per run.
+
+    # --- Interactive script prompts (e.g. missing address CSV) ---
+    def _on_script_prompt_line(self, line: str):
+        """Watch script output for prompt markers that need a user decision."""
+        m = re.match(r"^\[ADDRESS_MISSING\]\s*(.*)$", line.strip())
+        if not m:
+            return
+        worker = self.sender()
+        if not isinstance(worker, ProcWorker):
+            return
+        self._prompt_missing_address(worker, m.group(1).strip())
+
+    def _prompt_missing_address(self, worker: ProcWorker, client_po: str):
+        """Popup for a paused vendor script that found no address CSV for an order.
+
+        Custom QDialog (not QMessageBox) so "Open PDFs Folder" can open
+        Explorer WITHOUT closing the popup — the user drops the PDF in, then
+        clicks Try Again, which re-runs PDFExtract.py to rebuild the CSVs and
+        retries automatically. Closing the popup (X / Esc) counts as Try
+        Again; it re-appears if the CSV is still missing. Only the explicit
+        Skip Order button skips.
+        """
+        po_label = client_po or "(unknown)"
+        pdfs_dir = native_path(self.paths()["pdfs"])
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Missing Ship-To Address")
+        dlg.setMinimumWidth(520)
+        v = QtWidgets.QVBoxLayout(dlg)
+        v.setContentsMargins(16, 16, 16, 14)
+        v.setSpacing(10)
+
+        head = QtWidgets.QLabel(f"⚠  No address CSV was found for Client PO {po_label}.")
+        head.setStyleSheet("font-size: 11pt; font-weight: 600; color: #f9e2af;")
+        head.setWordWrap(True)
+        v.addWidget(head)
+
+        body = QtWidgets.QLabel(
+            "The order is paused and has NOT been submitted.\n\n"
+            "Put this order's PDF in:\n"
+            f"{pdfs_dir}\n\n"
+            "• Try Again — re-runs Extract From PDF to rebuild the CSVs, "
+            "then retries this order\n"
+            "• Skip Order — move on without placing this order"
+        )
+        body.setWordWrap(True)
+        v.addWidget(body)
+
+        btns = QtWidgets.QHBoxLayout()
+        btn_open = QtWidgets.QPushButton("📂  Open PDFs Folder")
+        btn_open.setProperty("btnstyle", "util")
+        btn_skip = QtWidgets.QPushButton("Skip Order")
+        btn_skip.setProperty("btnstyle", "danger")
+        btn_retry = QtWidgets.QPushButton("Try Again")
+        btn_retry.setProperty("btnstyle", "go")
+        btn_retry.setDefault(True)
+        btns.addWidget(btn_open)
+        btns.addStretch(1)
+        btns.addWidget(btn_skip)
+        btns.addWidget(btn_retry)
+        v.addLayout(btns)
+
+        choice = {"value": "retry"}   # X / Esc default to Try Again, never Skip
+
+        def _pick(val):
+            choice["value"] = val
+            dlg.accept()
+
+        # Opens Explorer while the popup stays open.
+        btn_open.clicked.connect(self.open_pdfs_folder)
+        btn_retry.clicked.connect(lambda: _pick("retry"))
+        btn_skip.clicked.connect(lambda: _pick("skip"))
+
+        dlg.exec()
+
+        if choice["value"] == "skip":
+            worker.send_line(f"skip {client_po}".strip())
+            self.log(f"⏭ Skipping order (Client PO {po_label}) — no address CSV.")
+            return
+
+        # Try Again → rebuild the CSVs from the PDFs, then retry automatically.
+        self.log(f"🔄 Rebuilding CSVs from PDFs, then retrying Client PO {po_label}…")
+        extract_worker = self.run_script(
+            "PDFExtract.py", label="PDFExtract.py (rebuild CSVs)"
+        )
+        if extract_worker is None:
+            # Could not start extraction — fall back to a plain retry so the
+            # popup re-appears instead of leaving the script hanging.
+            worker.send_line(f"retry {client_po}".strip())
+            return
+
+        def _after_regen(rc):
+            if rc == 0:
+                self.log("🔁 CSV rebuild finished — telling the paused script to try again…")
+            else:
+                self.log(f"[WARN] PDFExtract exited with code {rc} — trying again anyway…")
+            worker.send_line(f"retry {client_po}".strip())
+
+        extract_worker.finished.connect(_after_regen)
 
     # --- Back-Orders + PM numbers pipeline ---
     def run_backorders_then_pm(self, extra_args: list[str] | None = None):

@@ -60,32 +60,32 @@ SKIPPED_ORDERS_PATH = os.path.join(SCRIPT_DIR, "skipped_orders.xlsx")
 
 PRODUCT_MAP = {
     "3W045CH": {
-        "url": "https://shop.broberry.com/shop/product/1406495",
+        "url": "https://shop.broberry.com/shop/product/1462529",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42, 44, 46],
         "mode": "grid",
     },
     "3W045DK": {
-        "url": "https://shop.broberry.com/shop/product/1406722",
+        "url": "https://shop.broberry.com/shop/product/1462564",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42, 44, 46],
         "mode": "grid",
     },
     "3W060BR": {
-        "url": "https://shop.broberry.com/shop/product/1407233",
+        "url": "https://shop.broberry.com/shop/product/1462875",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62],
         "mode": "grid",
     },
     "10FR13MWZ": {
-        "url": "https://shop.broberry.com/shop/product/1392822",
+        "url": "https://shop.broberry.com/shop/product/1444629",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54],
         "mode": "auto",
     },
     "10FR13MMS": {
-        "url": "https://shop.broberry.com/shop/product/1392784",
+        "url": "https://shop.broberry.com/shop/product/1444608",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42],
         "mode": "auto",
     },
     "10FR47MLW": {
-        "url": "https://shop.broberry.com/shop/product/1393239",
+        "url": "https://shop.broberry.com/shop/product/1445120",
         "sizes": [30, 31, 32, 33, 34, 35, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54],
         "mode": "auto",
     },
@@ -97,7 +97,7 @@ PRODUCT_MAP = {
     "F52594X250": {
         "url": "https://shop.broberry.com/shop/product/1094476",
         "sizes": [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],
-        "mode": "auto",
+        "mode": "length_grid",
     },
     "10030232": {
         "url": "https://shop.broberry.com/shop/product/1083190",
@@ -105,6 +105,47 @@ PRODUCT_MAP = {
         "mode": "auto",
     },
 }
+
+def sync_product_links_from_main_script():
+    """Adopt current product links (and size lists) from BroberryShop.py.
+
+    BroberryShop.py is the source of truth for shop product URLs — they change
+    whenever products are republished in the shop, and this file's local copy
+    has gone stale before (orders then silently fail as 'unavailable' against
+    dead product pages). At startup we import its PRODUCT_MAP and adopt 'url'
+    and 'sizes' for SKUs we share. 'mode' is NEVER adopted: modes select
+    size-entry BEHAVIOR in this file's own locator code, so they are kept in
+    sync by hand, not at runtime. Degrades to the local values if the import
+    fails.
+    """
+    try:
+        from BroberryShop import PRODUCT_MAP as MAIN_MAP
+    except Exception as e:
+        print(f"⚠️  Could not read product links from BroberryShop.py ({e}) — "
+              "using this file's local links.")
+        return
+
+    updated = []
+    for sku, info in PRODUCT_MAP.items():
+        main_info = MAIN_MAP.get(sku)
+        if not main_info:
+            print(f"⚠️  {sku} is not in BroberryShop.py's PRODUCT_MAP — keeping local entry.")
+            continue
+        if main_info.get("url") and main_info["url"] != info["url"]:
+            updated.append(f"{sku}: {info['url']} → {main_info['url']}")
+            info["url"] = main_info["url"]
+        if main_info.get("sizes") and main_info["sizes"] != info.get("sizes"):
+            info["sizes"] = list(main_info["sizes"])
+            updated.append(f"{sku}: sizes updated")
+
+    if updated:
+        print("🔗 Product links refreshed from BroberryShop.py:")
+        for line in updated:
+            print(f"   {line}")
+        print("   (Consider syncing the PRODUCT_MAP literal in this file too.)")
+    else:
+        print("✓ Product links match BroberryShop.py")
+
 
 # ─── AUTOMATIC SUBSTITUTION PAIRS ─────────────────────────────────────────────
 # Mirrors PAIRABLE in BroberryShop.py — kept local to match the file's existing
@@ -119,6 +160,79 @@ PAIRABLE = {
     "10FR13MWZ": "10FR13MMS",
     "10FR13MMS": "10FR13MWZ",
 }
+
+# ─── LENGTH NORMALISATION (F52594X250: Short/Regular/Long/Unhemmed row labels) ──
+# Ported from BroberryShop.py so length_grid products behave identically here.
+LENGTH_ALIASES = {
+    # Short
+    "s": "Short", "sh": "Short", "sht": "Short", "short": "Short",
+    # Regular
+    "r": "Regular", "reg": "Regular", "regular": "Regular", "regl": "Regular",
+    # Long
+    "l": "Long", "lng": "Long", "long": "Long",
+    # Unhemmed
+    "u": "Unhemmed", "unh": "Unhemmed", "unhemmed": "Unhemmed", "unhem": "Unhemmed",
+}
+
+
+def normalize_length(val):
+    """Normalise a length abbreviation → 'Short'/'Regular'/'Long'/'Unhemmed'.
+    Returns None if the value is not a recognised length alias."""
+    if val is None:
+        return None
+    return LENGTH_ALIASES.get(str(val).strip().lower())
+
+
+def resolve_length_grid_dims(size1_raw, size2_raw):
+    """Determine which CSV field is the numeric size and which is the length label
+    for 'length_grid' products (F52594X250).
+
+    Strategy:
+      1. If one field is a plain integer and the other normalises to a length → clear win.
+      2. If only one is an integer → treat as size; attempt to normalise the other as length.
+      3. If only one normalises as a length → treat as length; other assumed to be size.
+      4. Ambiguous (both text, both lengths) → prefer size1 as length, warn.
+
+    Returns (numeric_size: int | None, length_label: str | None).
+    """
+    def _to_int(v):
+        try:
+            return int(str(v).strip())
+        except (ValueError, TypeError):
+            return None
+
+    s1 = str(size1_raw).strip() if size1_raw is not None else ""
+    s2 = str(size2_raw).strip() if size2_raw is not None else ""
+
+    n1, n2 = _to_int(s1), _to_int(s2)
+    l1, l2 = normalize_length(s1), normalize_length(s2)
+
+    # Unambiguous cases
+    if n1 is not None and l2 is not None:
+        return n1, l2        # size1=number, size2=length  ← typical
+    if n2 is not None and l1 is not None:
+        return n2, l1        # size2=number, size1=length  ← reversed
+
+    # One side is numeric, length side unrecognised
+    if n1 is not None:
+        return n1, l2        # l2 may be None; caller will log warning
+    if n2 is not None:
+        return n2, l1
+
+    # Neither is numeric; both text
+    if l1 is not None and l2 is None:
+        return None, l1
+    if l2 is not None and l1 is None:
+        return None, l2
+
+    # Both look like length aliases (e.g. "S", "L") — default: size1=length
+    if l1 is not None:
+        print(f"⚠️  Ambiguous dims for length_grid product "
+              f"(size1={s1!r}, size2={s2!r}). Treating size1 as length.")
+        return None, l1
+
+    return None, None
+
 
 # Module-level flag set by main() from argparse.  When True, process_backorder_csv
 # will compare the restock dates of an item and its registered sub and place
@@ -185,6 +299,26 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
         inseam_i = int(inseam) if inseam is not None and str(inseam).strip() != "" else None
     except Exception:
         inseam_i = None
+    # Raw string form needed for length_grid products (Short/Regular/Long/Unhemmed)
+    inseam_str = str(inseam).strip() if inseam is not None else ""
+
+    # Shared helper: derive the 1-based column index for a given waist/size value
+    # by scanning the table header.  Defined at outer scope so both try_grid and
+    # try_length_grid can call it.
+    def _col_index_for_waist(table, w):
+        w = str(w).strip()
+        xpaths = [
+            f".//thead//tr//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
+            f".//tr[1]//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
+            f".//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
+        ]
+        for xp in xpaths:
+            els = table.find_elements(By.XPATH, xp)
+            if not els:
+                continue
+            el = els[0]
+            return len(el.find_elements(By.XPATH, "preceding-sibling::*[self::th or self::td]")) + 1
+        return None
 
     def try_grid():
         if inseam_i is None:
@@ -196,21 +330,6 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
             By.XPATH,
             f"//td[contains(@class,'sticky') and normalize-space()='{inseam_i}']"
         )
-
-        def _col_index_for_waist(table, w):
-            w = str(w).strip()
-            xpaths = [
-                f".//thead//tr//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
-                f".//tr[1]//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
-                f".//*[self::th or self::td][normalize-space()='{w}' and not(.//input)]",
-            ]
-            for xp in xpaths:
-                els = table.find_elements(By.XPATH, xp)
-                if not els:
-                    continue
-                el = els[0]
-                return len(el.find_elements(By.XPATH, "preceding-sibling::*[self::th or self::td]")) + 1
-            return None
 
         row   = header_td.find_element(By.XPATH, "ancestor::tr[1]")
         table = header_td.find_element(By.XPATH, "ancestor::table[1]")
@@ -240,6 +359,47 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
             raise UnorderableSizeError(f"{sku} size {waist_i} is not orderable (no qty input)")
         return qty_inputs[0], row
 
+    def try_length_grid():
+        """Find the qty input for length_grid products (e.g. F52594X250) whose row
+        labels are text (Short / Regular / Long / Unhemmed) rather than integers."""
+        # inseam holds the normalised length label; waist holds the numeric size.
+        length_label = normalize_length(inseam_str) or inseam_str
+        if not length_label or waist_i is None:
+            return None
+
+        try:
+            header_td = driver.find_element(
+                By.XPATH,
+                f"//td[contains(@class,'sticky') and normalize-space()='{length_label}']"
+            )
+        except NoSuchElementException:
+            return None
+
+        row   = header_td.find_element(By.XPATH, "ancestor::tr[1]")
+        table = header_td.find_element(By.XPATH, "ancestor::table[1]")
+        col_idx = _col_index_for_waist(table, waist_i)
+
+        if col_idx is None and sizes:
+            try:
+                col_idx = sizes.index(waist_i) + 2  # +1 sticky label + 1-based
+            except ValueError:
+                return None
+
+        if col_idx is None:
+            return None
+
+        row_cells = row.find_elements(By.XPATH, "./*[self::td or self::th]")
+        if col_idx < 1 or col_idx > len(row_cells):
+            return None
+
+        cell   = row_cells[col_idx - 1]
+        inputs = cell.find_elements(By.CSS_SELECTOR, "input[type='number']")
+        if inputs:
+            return inputs[0], cell
+        raise UnorderableSizeError(
+            f"{sku} size {waist_i} {length_label} is not orderable (no qty input)"
+        )
+
     if mode == "grid":
         try:
             return try_grid()
@@ -248,6 +408,13 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
     if mode == "row":
         try:
             return try_row()
+        except Exception:
+            return None
+    if mode == "length_grid":
+        try:
+            return try_length_grid()
+        except UnorderableSizeError:
+            raise
         except Exception:
             return None
 
@@ -282,7 +449,9 @@ def try_add_line(driver, sku, waist, inseam, qty):
         return ('unavailable', 'qty input disabled')
 
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", qty_input)
-    qty_input.click()
+    # JS focus instead of .click(): each cell now has a hover-triggered price tooltip
+    # (absolute-positioned w-80 div, group-hover:flex) that intercepts mouse clicks.
+    driver.execute_script("arguments[0].focus();", qty_input)
     qty_input.send_keys(Keys.CONTROL, "a")
     qty_input.send_keys(Keys.DELETE)
     qty_input.send_keys(str(qty))
@@ -638,19 +807,20 @@ def has_propper_or_wrangler_items(driver):
 
 
 # ─── CHECKOUT HELPERS ─────────────────────────────────────────────────────────
-def fill_address_and_notes(driver, po, notes,
+def fill_address_and_notes(driver, po, notes, account_email=None,
                            ship_company=None, ship_attention=None,
                            ship_street=None, ship_city=None, ship_state=None, ship_zip=None):
+    """Fill PO + notes and the new-address shipping fields.
+
+    Ported from BroberryShop.py: the address page changed — the billing
+    section is left untouched (existing address default is kept), and the
+    shipping fields only exist after switching to the
+    'I want to use a new address' option.
+    """
     wait = WebDriverWait(driver, 10)
     driver.get(ADDRESS_URL)
 
-    billing_ln  = wait.until(EC.element_to_be_clickable((By.ID, "billing-last-name")))
-    shipping_ln = wait.until(EC.element_to_be_clickable((By.ID, "shipping-last-name")))
-    for el in (billing_ln, shipping_ln):
-        el.clear()
-        el.send_keys(str(po))
-
-    po_fld = wait.until(EC.element_to_be_clickable((By.ID, "order-purchase-order")))
+    po_fld  = wait.until(EC.element_to_be_clickable((By.ID, "order-purchase-order")))
     po_fld.clear()
     po_fld.send_keys(str(po))
 
@@ -659,11 +829,22 @@ def fill_address_and_notes(driver, po, notes,
     if notes:
         notes_f.send_keys("\n".join(notes))
 
+    # Switch shipping section to "I want to use a new address"
+    new_addr_radio = wait.until(EC.presence_of_element_located((
+        By.CSS_SELECTOR, 'input[name="user_address[shipping][select_address]"][value="newAddressShipping"]'
+    )))
+    driver.execute_script("arguments[0].click();", new_addr_radio)
+
+    # Wait for the new-address shipping panel to become visible (required attrs appear on first-name)
+    wait.until(EC.visibility_of_element_located((By.ID, "shipping-first-name")))
+
     def _norm(v):
-        if v is None: return ""
+        if v is None:
+            return ""
         s = str(v).strip()
         return "" if (not s or s.lower() == "nan") else s
 
+    # Company line: ship_company + ship_attention combined (carries the real customer name)
     company_line_parts = [p for p in (_norm(ship_company), _norm(ship_attention)) if p]
     company_line = " ".join(company_line_parts).strip()
 
@@ -673,24 +854,41 @@ def fill_address_and_notes(driver, po, notes,
         except Exception:
             return None
 
-    comp_el = _get_by_id("shipping-company")
-    addr_el = _get_by_id("shipping-address-1")
-    city_el = _get_by_id("shipping-city")
-    zip_el  = _get_by_id("shipping-postal-code")
-    st_el   = _get_by_id("shipping-state")
+    email_el = _get_by_id("shipping-email-address", timeout=2)
+    comp_el  = _get_by_id("shipping-company", timeout=2)
+    fn_el    = _get_by_id("shipping-first-name", timeout=2)
+    ln_el    = _get_by_id("shipping-last-name", timeout=2)
+    addr_el  = _get_by_id("shipping-address-1", timeout=2)
+    city_el  = _get_by_id("shipping-city", timeout=2)
+    zip_el   = _get_by_id("shipping-postal-code", timeout=2)
+    st_el    = _get_by_id("shipping-state", timeout=2)
+    phone_el = _get_by_id("shipping-phone-no", timeout=2)
 
+    if email_el and _norm(account_email):
+        email_el.clear(); email_el.send_keys(_norm(account_email))
     if comp_el and company_line:
         comp_el.clear(); comp_el.send_keys(company_line)
+    if fn_el:
+        fn_el.clear(); fn_el.send_keys(str(po))
+    if ln_el:
+        ln_el.clear(); ln_el.send_keys(str(po))
     if addr_el and _norm(ship_street):
         addr_el.clear(); addr_el.send_keys(_norm(ship_street))
     if city_el and _norm(ship_city):
         city_el.clear(); city_el.send_keys(_norm(ship_city))
     if zip_el and _norm(ship_zip):
-        zip_el.click()
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", zip_el)
+        # JS focus instead of .click(): the right-column order summary overlays the
+        # zip field at some scroll positions and intercepts mouse clicks. CTRL+A +
+        # send_keys is kept because .clear() is unreliable on type=number inputs.
+        driver.execute_script("arguments[0].focus();", zip_el)
         zip_el.send_keys(Keys.CONTROL, "a")
         zip_el.send_keys(_norm(ship_zip))
+    if phone_el:
+        phone_el.clear(); phone_el.send_keys("407.682.1400")
+
     if st_el and _norm(ship_state):
-        state_in   = _norm(ship_state).upper()
+        state_in = _norm(ship_state).upper()
         state_name = STATE_ABBR_TO_NAME.get(state_in, _norm(ship_state))
         try:
             from selenium.webdriver.support.ui import Select
@@ -698,9 +896,13 @@ def fill_address_and_notes(driver, po, notes,
         except Exception:
             pass
 
-    wait.until(EC.element_to_be_clickable((
+    # JS click: the 2-column checkout layout has a short right column, so after
+    # scrolling the zip field into view this button ends up above the viewport
+    # and a coordinate-based click is rejected.
+    continue_btn = wait.until(EC.element_to_be_clickable((
         By.CSS_SELECTOR, "button.w-full.rounded-md.bg-rose-600"
-    ))).click()
+    )))
+    driver.execute_script("arguments[0].click();", continue_btn)
     time.sleep(1)
 
 
@@ -837,7 +1039,7 @@ def load_skipped_pos():
 
 
 # ─── ORDER PROCESSING (NO SUBSTITUTION) ──────────────────────────────────────
-def process_backorder_csv(driver, csv_path):
+def process_backorder_csv(driver, csv_path, account_email=None):
     """
     Place a previously-skipped (back-order) order from its CSV.
     - NO substitution / sub logic.
@@ -880,14 +1082,29 @@ def process_backorder_csv(driver, csv_path):
         sku     = str(row["Item-Number"]).strip()
         waist_v  = row.get("Size-1", "")
         inseam_v = row.get("Size-2", "")
-        waist  = int(waist_v)  if str(waist_v).strip()  not in ("", "nan") else None
-        inseam = int(inseam_v) if str(inseam_v).strip() not in ("", "nan") else None
-        qty_v  = row.get("Qty", 0)
-        qty    = int(qty_v)   if str(qty_v).strip()    not in ("", "nan") else 0
 
         if sku not in PRODUCT_MAP:
             print(f"⚠️  Unknown SKU '{sku}' in {os.path.basename(csv_path)} — skipping line.")
             continue
+
+        # length_grid products (F52594X250): one dim is a text label (Short/Regular/Long/Unhemmed)
+        # and the other is the numeric size 2-24.  Resolve which is which automatically.
+        if PRODUCT_MAP[sku].get("mode") == "length_grid":
+            waist, inseam = resolve_length_grid_dims(waist_v, inseam_v)
+            if inseam is None:
+                print(f"⚠️  Could not determine length for {sku} "
+                      f"(size1={waist_v!r}, size2={inseam_v!r}). Skipping line.")
+                continue
+            if waist is None:
+                print(f"⚠️  Could not determine numeric size for {sku} "
+                      f"(size1={waist_v!r}, size2={inseam_v!r}). Skipping line.")
+                continue
+        else:
+            # Standard products: size1=waist (int), size2=inseam (int or blank)
+            waist  = int(waist_v)  if str(waist_v).strip()  not in ("", "nan") else None
+            inseam = int(inseam_v) if str(inseam_v).strip() not in ("", "nan") else None
+        qty_v  = row.get("Qty", 0)
+        qty    = int(qty_v)   if str(qty_v).strip()    not in ("", "nan") else 0
 
         # --prefer-sooner: swap to the registered sub if it restocks earlier.
         # Skip when the merge pre-pass already decided this row.
@@ -929,18 +1146,19 @@ def process_backorder_csv(driver, csv_path):
     # ── Address / notes page ────────────────────────────────────────────────
     fill_address_and_notes(
         driver, po_number, notes,
-        ship_company, ship_attention,
-        ship_street, ship_city, ship_state, ship_zip
+        account_email=account_email,
+        ship_company=ship_company, ship_attention=ship_attention,
+        ship_street=ship_street, ship_city=ship_city,
+        ship_state=ship_state, ship_zip=ship_zip
     )
 
     wait = WebDriverWait(driver, 10)
-    wait.until(EC.element_to_be_clickable((
+    # JS click: same 2-column layout issue as the address page — the button can
+    # sit outside the viewport and a coordinate-based click is rejected.
+    continue_btn = wait.until(EC.element_to_be_clickable((
         By.XPATH, "//button[contains(., 'Continue To Shipping and Payment Method')]"
-    ))).click()
-
-    # ── Shipper number (if needed) ──────────────────────────────────────────
-    if shipper_number:
-        fill_shipper_number(driver, shipper_number)
+    )))
+    driver.execute_script("arguments[0].click();", continue_btn)
 
     # ── Shipping method ─────────────────────────────────────────────────────
     try:
@@ -959,6 +1177,12 @@ def process_backorder_csv(driver, csv_path):
             )
         driver.execute_script("arguments[0].click();", ship_radio)
 
+    # ── Shipper number (if needed) ──────────────────────────────────────────
+    # Must come AFTER the shipping method: the field is only revealed once the
+    # Wrangler - Shipper Account option is selected (ported from BroberryShop.py).
+    if shipper_number:
+        fill_shipper_number(driver, shipper_number)
+
     # ── Payment method ──────────────────────────────────────────────────────
     pay = wait.until(EC.presence_of_element_located(
         (By.CSS_SELECTOR, 'input[name="order[payment_id]"][value="1"]')
@@ -971,9 +1195,10 @@ def process_backorder_csv(driver, csv_path):
     except ElementClickInterceptedException:
         driver.execute_script("arguments[0].click();", pay)
 
-    wait.until(EC.element_to_be_clickable((
+    review_btn = wait.until(EC.element_to_be_clickable((
         By.XPATH, "//button[contains(., 'Continue and Review Order')]"
-    ))).click()
+    )))
+    driver.execute_script("arguments[0].click();", review_btn)
 
     # ── submit_order handles the checkbox + Complete Checkout ───────────────
     submit_order(driver)
@@ -1213,9 +1438,14 @@ def _write_pm_rows(records):
     creating the file from Example.xlsx template if it doesn't exist yet.
     """
     from openpyxl import load_workbook
+    from openpyxl.styles import Font
     from datetime import datetime
 
-    today = datetime.now().strftime("%m/%d/%Y")
+    now = datetime.now()
+    today = f"{now.month}.{now.day}.{now:%y}"   # e.g. 8.6.26
+    # Style the WHOLE row: the template's default font is the Office theme
+    # font (Aptos Narrow 11), so unstyled cells would not match Arial 10.
+    row_font = Font(name="Arial", size=10)
 
     if os.path.exists(OUTPUT_XLSX):
         wb = load_workbook(OUTPUT_XLSX)
@@ -1261,6 +1491,8 @@ def _write_pm_rows(records):
             "Freight (CC or N30)":               "Cust Acct",
         }
         ws.append([row_map.get(h, "") for h in headers])
+        for c in range(1, len(headers) + 1):
+            ws.cell(row=ws.max_row, column=c).font = row_font
         print(f"  📝 Wrote row: PO={rec['PO']}, order#={rec.get('order_num','')}")
 
     wb.save(OUTPUT_XLSX)
@@ -1308,6 +1540,9 @@ def run_pm_pipeline(matched_csvs):
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
+    # ── Keep product links current with BroberryShop.py ────────────────────
+    sync_product_links_from_main_script()
+
     # ── Load skipped POs from the Excel file ───────────────────────────────
     skipped_pos = load_skipped_pos()
     if not skipped_pos:
@@ -1366,7 +1601,7 @@ def main():
                 print(f"→ New session for account {current_account}")
 
             print(f"→ Using account {current_account} for PO {po} ({os.path.basename(csv_path)})")
-            process_backorder_csv(driver, csv_path)
+            process_backorder_csv(driver, csv_path, account_email=current_account)
             successfully_placed.append((csv_path, acct, po))
 
     finally:

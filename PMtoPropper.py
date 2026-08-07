@@ -34,6 +34,7 @@ import datetime
 import traceback
 
 import pandas as pd
+from openpyxl import load_workbook
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -295,6 +296,69 @@ def load_address_from_csv(client_po: str) -> dict:
 
     log(f"[WARN] Address CSV appears empty: {csv_path}")
     return {}
+
+
+def wait_for_address_data(client_po: str):
+    """Return ship-to data for client_po, pausing when the address CSV is missing.
+
+    If no CSV with a usable ship-to address is found, emit an '[ADDRESS_MISSING]'
+    marker line (the TSG app watches for it and shows a Try Again / Skip popup)
+    and block on stdin for the user's decision:
+      - 'retry <po>' → look for the CSV again
+      - 'skip <po>'  → return None so the caller skips this order
+    Responses tagged with a different PO (stale popup answers) are ignored.
+    Never proceeds with a blank address form.
+    """
+    expected_po = str(client_po).strip().lower()
+    while True:
+        addr = load_address_from_csv(client_po)
+        if addr and addr.get("street"):
+            return addr
+
+        log("")
+        log(f"[WARN] No usable address CSV found for Client PO {client_po} in {PDFS_DIR}")
+        log(f"[ADDRESS_MISSING] {client_po}")
+        log("[ACTION REQUIRED] Missing ship-to address — choose Try Again or Skip in the TSG app.")
+        log(f"(Running standalone? Type 'retry {client_po}' or 'skip {client_po}' and press Enter.)")
+
+        try:
+            resp = input().strip().lower()
+        except EOFError:
+            # No stdin attached — safest is to skip rather than submitting blanks.
+            log(f"[WARN] Input closed; skipping order for Client PO {client_po}.")
+            return None
+
+        parts = resp.split(None, 1)
+        action = parts[0] if parts else ""
+        resp_po = parts[1].strip() if len(parts) > 1 else ""
+
+        if resp_po and expected_po and resp_po != expected_po:
+            log(f"[INFO] Ignoring stale response for PO '{resp_po}' (waiting on {client_po}).")
+            continue
+        if action == 'skip':
+            log(f"[INFO] User chose to SKIP Client PO {client_po}.")
+            return None
+        if action == 'retry':
+            log(f"[INFO] Retrying address lookup for Client PO {client_po}...")
+            continue
+        # Anything else (e.g., a bare Enter from 'Verification Complete') → check again
+        log("[INFO] Unrecognized input; checking for the CSV again...")
+
+
+def wait_for_submit_enter():
+    """Block until the user confirms order submission (bare Enter / app button).
+
+    Ignores stale 'retry <po>' / 'skip <po>' replies left over from the
+    address-missing prompt so they can never trigger a premature submit.
+    """
+    while True:
+        resp = input().strip()
+        if not resp:
+            return
+        if resp.lower().startswith(("retry", "skip")):
+            log(f"[INFO] Ignoring stale address-prompt reply ('{resp}').")
+            continue
+        return
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -834,14 +898,15 @@ def update_order_id_in_excel(excel_path: str, row_index: int, order_id: str) -> 
     If the cell already has a value, append with ', ' as separator."""
     try:
         log(f"[INFO] Updating Excel with Order ID: {order_id}")
-        df = pd.read_excel(excel_path, engine="openpyxl", dtype=str)
 
-        # Ensure column M exists
-        while len(df.columns) < 13:
-            df.insert(len(df.columns), f"Column_{len(df.columns)}", "")
+        # Targeted openpyxl write: only touch the one column-M cell so the
+        # rest of the workbook (values, fonts, date formatting) is preserved.
+        # A full pandas read/to_excel round-trip would reset all formatting.
+        wb = load_workbook(excel_path)
+        ws = wb.active
+        cell = ws.cell(row=row_index + 2, column=13)  # +2: header row, 1-based
 
-        col_m = df.columns[12]
-        existing = coerce_str(df.at[row_index, col_m])
+        existing = coerce_str(cell.value)
 
         if existing:
             new_val = f"{existing}, {order_id}"
@@ -850,8 +915,8 @@ def update_order_id_in_excel(excel_path: str, row_index: int, order_id: str) -> 
             new_val = order_id
             log(f"[INFO] Setting Order ID: '{new_val}'")
 
-        df.at[row_index, col_m] = new_val
-        df.to_excel(excel_path, index=False)
+        cell.value = new_val
+        wb.save(excel_path)
         log(f"[OK] Excel updated: {excel_path}")
         return True
     except Exception as e:
@@ -952,6 +1017,7 @@ def main():
         login(driver)
 
         total = len(order_data)
+        skipped = []
         for order_num, (idx, row, order_no, csv_path) in enumerate(order_data, 1):
             po_number  = coerce_str(row[COL_G])
             client_po  = coerce_str(row[COL_D])
@@ -965,13 +1031,16 @@ def main():
             log(f"  CSV       : {os.path.basename(csv_path)}")
             log("─" * 60)
 
-            # Load shipping address from PDFS_DIR/{client_po}.csv  (e.g. 301500.csv)
-            addr = load_address_from_csv(client_po)
-            if addr:
-                log(f"[INFO] Ship to: {addr.get('company','?')} | "
-                    f"{addr.get('city','?')}, {addr.get('state','?')} {addr.get('zip','?')}")
-            else:
-                log("[WARN] No address data found — fields may be left blank.")
+            # Load shipping address from PDFS_DIR/{client_po}.csv  (e.g. 301500.csv).
+            # Pauses (Try Again / Skip popup in the TSG app) if the CSV is missing,
+            # so we never proceed with a blank address form.
+            addr = wait_for_address_data(client_po)
+            if addr is None:
+                skipped.append((po_number, client_po))
+                log(f"[SKIP] Order PO {po_number} (Client PO {client_po}) skipped — no address CSV.")
+                continue
+            log(f"[INFO] Ship to: {addr.get('company','?')} | "
+                f"{addr.get('city','?')}, {addr.get('state','?')} {addr.get('zip','?')}")
 
             # ── Step 1: Upload CSV + Add to Cart ──────────────────────────────
             upload_and_add_to_cart(driver, csv_path)
@@ -1001,7 +1070,7 @@ def main():
             log("║  • In the app → click '✅ Verification Complete'        ║")
             log("║  • Running standalone → press Enter                     ║")
             log("╚" + "═" * 56 + "╝")
-            input("")   # Blocks until Enter is sent (app sends '\n' via stdin)
+            wait_for_submit_enter()   # Blocks until Enter is sent (app sends '\n' via stdin)
             log("[INFO] User confirmed — placing order...")
 
             # ── Step 7: Place Order ───────────────────────────────────────────
@@ -1018,7 +1087,11 @@ def main():
         log("")
         log("=" * 60)
         log("*** PROPPER AUTOMATION COMPLETE ***")
-        log(f"    {total} order(s) processed.")
+        log(f"    {total - len(skipped)} order(s) placed.")
+        if skipped:
+            log(f"    {len(skipped)} order(s) skipped (missing address CSV):")
+            for po, cpo in skipped:
+                log(f"      - PO {po} (Client PO {cpo})")
         log("=" * 60)
 
     except Exception as e:

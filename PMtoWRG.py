@@ -258,6 +258,54 @@ def load_shipto_data_from_csv(po_number: str) -> dict:
     return {}
 
 
+def wait_for_shipto_data(client_po: str):
+    """Return ship-to data for client_po, pausing when the address CSV is missing.
+
+    If no CSV with a ship-to address is found, emit an '[ADDRESS_MISSING]'
+    marker line (the TSG app watches for it and shows a Try Again / Skip
+    popup) and block on stdin for the user's decision:
+      - 'retry <po>' → look for the CSV again
+      - 'skip <po>'  → return None so the caller skips this order
+    Responses tagged with a different PO (stale popup answers) are ignored.
+    Never falls back to the default Sourcing Group address.
+    """
+    expected_po = str(client_po).strip().lower()
+    while True:
+        shipto_data = load_shipto_data_from_csv(client_po)
+        if shipto_data and shipto_data.get('shipTo'):
+            return shipto_data
+
+        log("")
+        log(f"[WARN] No address CSV found for Client PO {client_po} in {PDFS_DIR}")
+        log(f"[ADDRESS_MISSING] {client_po}")
+        log("[ACTION REQUIRED] Missing ship-to address — choose Try Again or Skip in the TSG app.")
+        log(f"(Running standalone? Type 'retry {client_po}' or 'skip {client_po}' and press Enter.)")
+
+        try:
+            resp = input().strip().lower()
+        except EOFError:
+            # No stdin attached — safest is to skip rather than silently
+            # shipping to the default Sourcing Group address.
+            log(f"[WARN] Input closed; skipping order for Client PO {client_po}.")
+            return None
+
+        parts = resp.split(None, 1)
+        action = parts[0] if parts else ""
+        resp_po = parts[1].strip() if len(parts) > 1 else ""
+
+        if resp_po and expected_po and resp_po != expected_po:
+            log(f"[INFO] Ignoring stale response for PO '{resp_po}' (waiting on {client_po}).")
+            continue
+        if action == 'skip':
+            log(f"[INFO] User chose to SKIP Client PO {client_po}.")
+            return None
+        if action == 'retry':
+            log(f"[INFO] Retrying address lookup for Client PO {client_po}...")
+            continue
+        # Anything else (e.g., a bare Enter from 'Verification Complete') → check again
+        log("[INFO] Unrecognized input; checking for the CSV again...")
+
+
 def coerce_date(val) -> str:
     """Return a mm/dd/yyyy string for dates coming from Excel/datetime/strings."""
     if val is None:
@@ -1040,21 +1088,27 @@ def submit_checkout(driver, timeout=25):
         pass
 
 
-def checkout_and_ship(driver, po_number: str, client_po: str):
+def checkout_and_ship(driver, po_number: str, client_po: str, shipto_data: dict = None):
     """
     Navigate to checkout and handle ship-to selection based on address:
     - If default Sourcing Group address: select radio and proceed normally
-    - If non-default address: select Sourcing Group radio, click Select, 
+    - If non-default address: select Sourcing Group radio, click Select,
       click Drop Ship, and fill the drop ship form
     """
-    # Load the extracted ship-to data for this client PO
-    shipto_data = load_shipto_data_from_csv(client_po)
-    
+    # Load the extracted ship-to data for this client PO (unless pre-loaded by caller)
+    if shipto_data is None:
+        shipto_data = load_shipto_data_from_csv(client_po)
+
     if not shipto_data or not shipto_data.get('shipTo'):
-        log(f"[WARN] No ship-to data found for {client_po}; falling back to default behavior.")
-        is_default_shipto = True
-    else:
-        is_default_shipto = is_default_sourcing_group_shipto(shipto_data['shipTo'])
+        # Safety net: never silently submit to the default Sourcing Group
+        # address when the PO's address data is missing. main() prompts the
+        # user (Try Again / Skip) via wait_for_shipto_data() before calling us.
+        raise RuntimeError(
+            f"No ship-to address available for Client PO {client_po}; "
+            "refusing to submit with the default Sourcing Group address."
+        )
+
+    is_default_shipto = is_default_sourcing_group_shipto(shipto_data['shipTo'])
     
     # 1) Navigate to checkout
     driver.get(CHECKOUT_URL)
@@ -1248,8 +1302,9 @@ def main():
         # Filter to only rows where column K contains "Wrangler" (case-insensitive)
         df = df[df[col_k].fillna("").str.contains("Wrangler", case=False, na=False)].reset_index(drop=True)
 
-        # track which row/index and PO we processed
+        # track which row/index and PO we processed / skipped
         processed = []
+        skipped = []
 
         total_orders = len(df)
         log("")
@@ -1274,10 +1329,19 @@ def main():
             log(f"  - Client PO: {client_po}")
             log(f"  - Order File: {order_no}")
 
+            # Require ship-to data BEFORE touching the vendor site so a
+            # missing address CSV can be fixed (Try Again) or the order
+            # skipped cleanly from the TSG app.
+            shipto_data = wait_for_shipto_data(client_po)
+            if shipto_data is None:
+                skipped.append((idx, draft_name, client_po))
+                log(f"[SKIP] Order {draft_name} (Client PO {client_po}) skipped — no address CSV.")
+                continue
+
             open_order_menu(driver)
             create_new_draft(driver, draft_name, ship_date)
             upload_batch_order(driver, order_no)
-            checkout_and_ship(driver, draft_name, client_po)
+            checkout_and_ship(driver, draft_name, client_po, shipto_data)
 
             processed.append((idx, draft_name, client_po))
             log(f"[OK] Order {draft_name} placed successfully!")
@@ -1291,6 +1355,10 @@ def main():
         log("*** ORDER PLACEMENT COMPLETE ***")
         log("="*60)
         log(f"Total Orders Placed: {len(processed)}")
+        if skipped:
+            log(f"Orders Skipped (missing address CSV): {len(skipped)}")
+            for _, dn, cpo in skipped:
+                log(f"  - {dn} (Client PO {cpo})")
         log(f"Excel File: {EXCEL_PATH}")
         log("")
         log("[INFO] Use 'Get Order IDs' button to fetch Order IDs after placement")

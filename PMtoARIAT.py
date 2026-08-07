@@ -5,6 +5,7 @@ import glob
 import time
 import math
 import pandas as pd
+from openpyxl import load_workbook
 
 # Make stdout/stderr robust to non-UTF-8 consoles (e.g. Windows cp1252 when this
 # script is launched standalone or with its output redirected).  Without this a
@@ -888,6 +889,73 @@ def load_shipto_from_po_csv(po_number: str) -> dict:
     )
 
 
+def wait_for_shipto_data(po_number: str):
+    """Return ship-to data for po_number, pausing when the address CSV is missing.
+
+    If no CSV with a usable ship-to address is found, emit an '[ADDRESS_MISSING]'
+    marker line (the TSG app watches for it and shows a Try Again / Skip popup)
+    and block on stdin for the user's decision:
+      - 'retry <po>' → look for the CSV again
+      - 'skip <po>'  → return None so the caller skips this order
+    Responses tagged with a different PO (stale popup answers) are ignored.
+    """
+    po_key = extract_po_key(po_number)
+    expected_po = str(po_key).strip().lower()
+    while True:
+        try:
+            addr = load_shipto_from_po_csv(po_number)
+        except Exception as e:
+            print(f"[WARN] Could not load address CSV for PO {po_number}: {e}")
+            addr = None
+        if addr and addr.get("street"):
+            return addr
+
+        print("")
+        print(f"[WARN] No usable address CSV for PO {po_number} in {PDF_DIR}")
+        print(f"[ADDRESS_MISSING] {po_key}")
+        print("[ACTION REQUIRED] Missing ship-to address — choose Try Again or Skip in the TSG app.")
+        print(f"(Running standalone? Type 'retry {po_key}' or 'skip {po_key}' and press Enter.)")
+
+        try:
+            resp = input().strip().lower()
+        except EOFError:
+            # No stdin attached — safest is to skip rather than guessing an address.
+            print(f"[WARN] Input closed; skipping order for PO {po_number}.")
+            return None
+
+        parts = resp.split(None, 1)
+        action = parts[0] if parts else ""
+        resp_po = parts[1].strip() if len(parts) > 1 else ""
+
+        if resp_po and expected_po and resp_po != expected_po:
+            print(f"[INFO] Ignoring stale response for PO '{resp_po}' (waiting on {po_key}).")
+            continue
+        if action == 'skip':
+            print(f"[INFO] User chose to SKIP PO {po_number}.")
+            return None
+        if action == 'retry':
+            print(f"[INFO] Retrying address lookup for PO {po_number}...")
+            continue
+        # Anything else (e.g., a bare Enter from 'Verification Complete') → check again
+        print("[INFO] Unrecognized input; checking for the CSV again...")
+
+
+def wait_for_submit_enter():
+    """Block until the user confirms order submission (bare Enter / app button).
+
+    Ignores stale 'retry <po>' / 'skip <po>' replies left over from the
+    address-missing prompt so they can never trigger a premature submit.
+    """
+    while True:
+        resp = input().strip()
+        if not resp:
+            return
+        if resp.lower().startswith(("retry", "skip")):
+            print(f"[INFO] Ignoring stale address-prompt reply ('{resp}').")
+            continue
+        return
+
+
 def _shell_is_ready(driver) -> bool:
     """True once the Dojo order-builder shell is present (the Menu widget).
 
@@ -1273,8 +1341,10 @@ def _handle_address_validation_warning(driver, timeout: int = 6) -> bool:
         return False
 
 
-def fill_drop_ship_address(driver, po_number: str):
-    addr = load_shipto_from_po_csv(po_number)
+def fill_drop_ship_address(driver, po_number: str, addr: dict = None):
+    # Address is normally pre-loaded (and user-confirmed) by wait_for_shipto_data()
+    if addr is None:
+        addr = load_shipto_from_po_csv(po_number)
 
     wait_and_click(driver, By.CSS_SELECTOR, "span.btnDropShip", timeout=WAIT_LONG)
 
@@ -1460,22 +1530,16 @@ def update_order_id_in_excel(excel_path: str, row_index: int, order_id: str):
     """
     try:
         print(f"[INFO] Updating Excel file with Order ID: {order_id}")
-        
-        # Read the Excel file
-        df = pd.read_excel(excel_path, engine="openpyxl", dtype=str)
-        
-        # Ensure column M (index 12) exists for Order ID
-        if len(df.columns) < 13:
-            # Add columns if needed
-            while len(df.columns) < 13:
-                df.insert(len(df.columns), f'Column_{len(df.columns)}', '')
-        
-        # Get or create column M
-        col_m_name = df.columns[12]
-        
-        # Get existing value in column M for this row
-        existing_value = coerce_str(df.at[row_index, col_m_name])
-        
+
+        # Targeted openpyxl write: only touch the one column-M cell so the
+        # rest of the workbook (values, fonts, date formatting) is preserved.
+        # A full pandas read/to_excel round-trip would reset all formatting.
+        wb = load_workbook(excel_path)
+        ws = wb.active
+        cell = ws.cell(row=row_index + 2, column=13)  # +2: header row, 1-based
+
+        existing_value = coerce_str(cell.value)
+
         # Append or set the order ID
         if existing_value:
             new_value = f"{existing_value} {order_id}"
@@ -1483,13 +1547,11 @@ def update_order_id_in_excel(excel_path: str, row_index: int, order_id: str):
         else:
             new_value = order_id
             print(f"[INFO] Setting new Order ID: '{new_value}'")
-        
-        df.at[row_index, col_m_name] = new_value
-        
-        # Save back to Excel
-        df.to_excel(excel_path, index=False)
+
+        cell.value = new_value
+        wb.save(excel_path)
         print(f"[SUCCESS] Excel file updated: {excel_path}")
-        
+
         return True
         
     except Exception as e:
@@ -1514,6 +1576,8 @@ def main():
         col_k = df.columns[10]
         col_d = df.columns[3]   # Client PO number (used for file cleanup)
 
+        skipped = []
+
         for idx, row in df.iterrows():
             po_number   = coerce_str(row[col_g])
             order_field = coerce_str(row[col_j])
@@ -1536,13 +1600,21 @@ def main():
 
             print(f"\n=== ARIAT ORDER START: PO={po_number}  UploadID={order_no} ===")
 
+            # Require a usable ship-to address BEFORE touching the site so a
+            # missing CSV can be fixed (Try Again) or the order skipped cleanly.
+            addr = wait_for_shipto_data(po_number)
+            if addr is None:
+                skipped.append((po_number, client_po))
+                print(f"[SKIP] Order PO={po_number} (Client PO {client_po}) skipped — no address CSV.")
+                continue
+
             upload_path = find_latest_matching_file(order_no)
             print(f"[INFO] Using upload file: {upload_path}")
 
             import_file_flow(driver, upload_path)
             proceed_to_checkout_flow(driver)
 
-            addr = fill_drop_ship_address(driver, po_number)
+            addr = fill_drop_ship_address(driver, po_number, addr=addr)
             print(f"[INFO] Address loaded from: {addr['csv_path']}")
 
             fill_po_number_field(driver, po_number)
@@ -1551,7 +1623,7 @@ def main():
             print("\n[ACTION REQUIRED]")
             print("Review the cart / shipping / totals")
             print("When ready, press Enter to automatically submit the order...")
-            input()
+            wait_for_submit_enter()
 
             # Automatically submit the order
             try:
@@ -1573,6 +1645,12 @@ def main():
                 input("Press Enter to continue to next order...")
 
             print(f"=== ARIAT ORDER DONE: PO={po_number} ===")
+
+        if skipped:
+            print("")
+            print(f"[INFO] {len(skipped)} Ariat order(s) skipped (missing address CSV):")
+            for po, cpo in skipped:
+                print(f"  - PO {po} (Client PO {cpo})")
 
     finally:
         driver.quit()
