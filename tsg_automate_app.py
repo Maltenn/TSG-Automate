@@ -1762,13 +1762,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if has_propper:
             steps.append(("Propper", "PMtoPropper.py"))
 
+        # Exit code per vendor step — the purge below is gated on ALL of them
+        # succeeding, so a crashed vendor's PDFs/CSVs survive for the re-run.
+        step_results: dict[str, int] = {}
+
+        def _purge_if_all_clean(extra_reason: str = ""):
+            failed = [name for name, rc in step_results.items() if rc != 0]
+            if failed or extra_reason:
+                why = ", ".join(failed) if failed else extra_reason
+                self.log(f"[WARN] Keeping PDFs/CSVs — {why} did not finish cleanly (exit ≠ 0).")
+                self.log("[WARN] Fix and re-run the failed vendor(s); use 'Clear PDF Folder' once everything is placed.")
+                return
+            purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
+
         def run_get_order_ids_then_finish():
             """After all vendor scripts finish, run GetOrderId (Wrangler-only
             lookup — skipped when no Wrangler orders were placed), then purge
-            old files."""
+            old files ONLY if every vendor step exited cleanly."""
             if not has_wrg:
                 self.log("[INFO] No Wrangler orders in this batch — skipping Get Order IDs.")
-                purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
+                _purge_if_all_clean()
                 self.log("◆ Place Orders with Vendor complete.")
                 if on_complete:
                     on_complete(0)
@@ -1779,7 +1792,7 @@ class MainWindow(QtWidgets.QMainWindow):
             worker = self.run_script("GetOrderId.py", stdin_pipe=True, label="GetOrderId.py")
             if worker is None:
                 self.log("[ERROR] GetOrderId.py did not start.")
-                purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
+                _purge_if_all_clean(extra_reason="GetOrderId.py (did not start)")
                 if on_complete:
                     on_complete(1)
                 return
@@ -1793,8 +1806,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.log("◆ Get Order IDs completed successfully.")
                 else:
                     self.log(f"◆ Get Order IDs exited with code {rc}")
-                # Clean up PDFs/CSVs now that all orders are placed and IDs fetched
-                purge_pdfs_and_csvs(self.paths()["pdfs"], self.log)
+                # Clean up PDFs/CSVs only when every step finished cleanly
+                _purge_if_all_clean(extra_reason="" if rc == 0 else "GetOrderId.py")
                 self.log("◆ Place Orders with Vendor complete.")
                 if on_complete:
                     on_complete(0)
@@ -1834,7 +1847,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.running.interactive = None
                 self._set_verify_enabled(False)
                 self._set_finalize_enabled(False)
-                self.log(f"◆ {vendor_name} exited with code {rc}")
+                step_results[vendor_name] = rc
+                if rc == 0:
+                    self.log(f"◆ {vendor_name} exited with code {rc}")
+                else:
+                    self.log(f"[ERROR] {vendor_name} exited with code {rc} — its PDFs/CSVs will be kept for a re-run.")
                 run_step(i + 1)
 
             worker.finished.connect(_after)

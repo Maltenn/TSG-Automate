@@ -7,6 +7,10 @@ import pandas as pd
 import time
 import math
 
+from openpyxl import load_workbook
+
+import tsg_runlog
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -39,6 +43,13 @@ PASSWORD = os.getenv("WRANGLER_PASSWORD") or os.getenv("WRG_PASSWORD") or "Inter
 WAIT_SHORT = 10
 WAIT_LONG = 25
 WAIT_XLONG = 60
+
+# Debug mode: set TSG_DEBUG=1 to (a) expose Chrome DevTools on port 9224 so an
+# external tool can attach and inspect the live page, (b) HOLD the browser open
+# on errors instead of crashing out.  Failure screenshots/HTML are always saved
+# (see debug_dump below).
+TSG_DEBUG = os.getenv("TSG_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
+DEBUG_PORT = 9224
 
 # State abbreviation to full name mapping
 STATE_ABBREV_MAP = {
@@ -78,6 +89,150 @@ def debug_dump(driver, error_name="error"):
         log(f"[DEBUG] HTML saved: {html_path}")
     except Exception as e:
         log(f"[DEBUG] Failed to save debug info: {e}")
+
+# ─── CART (ORDER PAD) VERIFICATION & SELF-HEALING (added 2026-08-31) ──────────
+# Reproduced live: Wrangler's order pad is PER-DRAFT, but create_new_draft()
+# with a name that already exists RESUMES the existing draft — items included.
+# A crash-and-restart therefore resumed the dirty draft (same PO name), the
+# re-upload stacked on top, and the auto-submit placed DOUBLE quantities.
+# Guards: after draft creation the pad must be empty (else it is cleared), and
+# after upload / before submit the pad must EXACTLY match the upload file.
+
+def wrangler_pad_units(driver) -> int:
+    """Unit count from the header order-pad badge ('N Items / N Units').
+
+    The badge (.nav-rSideInfo) is present on every page, checkout included."""
+    try:
+        txt = driver.execute_script(
+            "var b=document.querySelector('.nav-rSideInfo'); return b ? b.textContent : ''") or ""
+    except Exception:
+        return -1
+    m = re.search(r"(\d+)\s*Units", txt.replace("\n", " "))
+    return int(m.group(1)) if m else -1
+
+
+def expected_units_from_upload_file(path: str) -> int:
+    """Sum the units column of a Wrangler batch upload file (.xlsx or .xml)."""
+    try:
+        if path.lower().endswith((".xlsx", ".xls")):
+            df = pd.read_excel(path, dtype=str)
+            col = None
+            for c in df.columns:
+                if str(c).strip().lower() in ("units", "qty", "quantity"):
+                    col = c
+                    break
+            if col is None:
+                return -1
+            total = 0
+            for v in df[col]:
+                s = coerce_str(v)
+                if s.isdigit():
+                    total += int(s)
+            return total
+        # Best-effort XML: sum numeric qty/units tags or attributes
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            xml = fh.read()
+        nums = re.findall(r"<(?:qty|units|quantity)>\s*(\d+)\s*</", xml, re.I)
+        if not nums:
+            nums = re.findall(r"(?:qty|units|quantity)\s*=\s*[\"'](\d+)[\"']", xml, re.I)
+        return sum(int(n) for n in nums) if nums else -1
+    except Exception as e:
+        log(f"[WARN] Could not read expected units from '{path}': {e}")
+        return -1
+
+
+def wrangler_clear_pad(driver) -> None:
+    """Empty the active draft's order pad via the site's own clear function.
+
+    (The Clear All link runs confirm_clear_ecatalogs() which shows an in-page
+    Yes/No modal — and the DOM contains a DECOY 'Yes' with no handler, so we
+    call the real clear_ecatalogs() directly.)"""
+    log("[CART_GUARD] Clearing the Wrangler order pad (clear_ecatalogs)...")
+    driver.execute_script("if (typeof clear_ecatalogs === 'function') { clear_ecatalogs(); }")
+    time.sleep(3.0)
+    driver.refresh()
+    wait_ready(driver, timeout=25)
+    time.sleep(1.5)
+    units = wrangler_pad_units(driver)
+    if units != 0:
+        debug_dump(driver, "pad_clear_failed")
+        raise RuntimeError(f"Order pad still shows {units} unit(s) after Clear All — refusing to continue.")
+    log("[CART_GUARD] Order pad is now empty.")
+
+
+def ensure_fresh_wrangler_pad(driver) -> None:
+    """Guarantee the just-activated draft's pad is EMPTY before uploading.
+
+    If create_new_draft resumed an existing same-name draft (crashed run),
+    its leftover items are cleared here — the upload then rebuilds the order
+    from scratch with correct quantities."""
+    time.sleep(1.5)
+    units = wrangler_pad_units(driver)
+    if units < 0:
+        # Badge unreadable on this page — go somewhere it exists and retry.
+        driver.get(BATCH_ORDER_URL)
+        wait_ready(driver, timeout=25)
+        time.sleep(1.0)
+        units = wrangler_pad_units(driver)
+    if units == 0:
+        log("[INFO] Pad check: order pad is empty — OK to upload.")
+        return
+    log(f"[CART_GUARD] Order pad has {units} leftover unit(s) — the draft was RESUMED "
+        "from a previous (crashed) run, not newly created!")
+    debug_dump(driver, "leftover_pad_before_clear")
+    wrangler_clear_pad(driver)
+
+
+def verify_wrangler_pad(driver, expected_units: int, context: str, settle_timeout: int = 30) -> None:
+    """Hard gate: pad units must EXACTLY match the upload file (polls while
+    the site finishes adding batch items)."""
+    if expected_units is None or expected_units < 0:
+        log(f"[CART_VERIFY] SKIPPED ({context}): expected units unknown for this upload file type.")
+        return
+    end = time.time() + settle_timeout
+    units = -1
+    while time.time() < end:
+        units = wrangler_pad_units(driver)
+        if units == expected_units:
+            log(f"[CART_VERIFY] OK ({context}): pad has {units} unit(s), expected {expected_units}.")
+            return
+        time.sleep(1.0)
+    debug_dump(driver, f"pad_mismatch_{context.replace(' ', '_')}")
+    raise RuntimeError(
+        f"ORDER PAD MISMATCH ({context}): pad shows {units} unit(s) but the upload file "
+        f"contains {expected_units} (waited {settle_timeout}s). NOT submitting — this is "
+        "exactly how double-quantity orders happened."
+    )
+
+
+def debug_hold(driver, context=""):
+    """In TSG_DEBUG mode, keep the browser open and wait for instructions on stdin.
+
+    Returns 'continue' (move on to the next order) or 'abort' (end the run).
+    In normal mode returns 'abort' immediately (fail-fast, as before) —
+    continuing past a half-finished order risks putting the next order's items
+    into a stale draft, so that decision is only offered to a human in debug mode.
+    """
+    if not TSG_DEBUG:
+        return "abort"
+    log("")
+    log(f"[DEBUG_HOLD] {context}")
+    log(f"[DEBUG_HOLD] Browser held open (DevTools on 127.0.0.1:{DEBUG_PORT}).")
+    log("[DEBUG_HOLD] Type 'continue' to move to the next order, or 'abort' to end the run.")
+    while True:
+        try:
+            resp = input().strip().lower()
+        except EOFError:
+            return "abort"
+        if resp == "continue":
+            log("[DEBUG_HOLD] Continuing with the next order.")
+            return "continue"
+        if resp == "abort":
+            log("[DEBUG_HOLD] Aborting the run.")
+            return "abort"
+        if resp:
+            log(f"[DEBUG_HOLD] Unrecognized input '{resp}' — type 'continue' or 'abort'.")
+
 
 def cleanup_old_debug_files():
     """Remove old debug screenshots and HTML files from script directory."""
@@ -457,15 +612,21 @@ def upload_batch_order(driver, order_no):
         available = os.listdir(DOWNLOAD_FOLDER)
         raise FileNotFoundError(f"No file for order {order_no} in {DOWNLOAD_FOLDER}. Contains: {available}")
 
+    # Newest file first — an old export for a re-used order number must not win
+    candidates.sort(key=lambda fp: os.path.getmtime(fp), reverse=True)
     xml_path = candidates[0]
     print(f"[INFO] Uploading file: {xml_path}")
     file_input.send_keys(xml_path)
-    time.sleep(9)
+    # Shortened fixed waits (were 9s/16s): the Add button already has a
+    # clickable-wait, and verify_wrangler_pad() polls the badge for up to 30s
+    # after this returns, absorbing slow server-side adds.
+    time.sleep(3)
     add_btn = wait.until(EC.element_to_be_clickable((
         By.XPATH, "//button[contains(@onclick,'add_ecat_items_to_cart_alert')]"
     )))
     add_btn.click()
-    time.sleep(16)
+    time.sleep(6)
+    return xml_path
 
 
 def wait_ready(driver, timeout=25):
@@ -594,7 +755,7 @@ def wait_modal_close(driver, timeout=10):
     ))
 
 
-def open_and_choose_ship_to(
+def _open_and_choose_ship_to_legacy(
     driver,
     preferred_radio_id: str = None,
     preferred_value_contains: str = None,
@@ -603,8 +764,10 @@ def open_and_choose_ship_to(
     max_retries: int = 5,
 ):
     """
-    Open the Ship-To modal and select the specified ship-to address.
-    Includes retry logic with page refresh for stale page state.
+    LEGACY — replaced by the rewritten open_and_choose_ship_to below (kept for
+    reference).  Its open-check and radio-visibility check lived in different
+    retry scopes, so a modal that opened briefly and closed again passed the
+    open-check and then hung on the radio wait.
     """
     wait = WebDriverWait(driver, 25)
     
@@ -726,9 +889,21 @@ def open_and_choose_ship_to(
             break
 
     if chosen_radio is None:
-        # Default to first radio if no match
-        chosen_radio = all_radios[0]
-        log("[WARN] No ship-to matched the criteria; selecting first available.")
+        # Never gamble on an arbitrary ship-to — a wrong pick here means the
+        # order ships/bills against the wrong account, silently.
+        debug_dump(driver, "shipto_no_match")
+        labels = []
+        for radio in all_radios[:10]:
+            try:
+                rid = radio.get_attribute("id")
+                lab = driver.find_element(By.XPATH, f"//label[input[@id='{rid}']]").text
+                labels.append(f"{rid}: {lab[:80]}")
+            except Exception:
+                continue
+        raise RuntimeError(
+            "No ship-to radio matched THE SOURCING GROUP criteria. "
+            f"Available options: {labels}"
+        )
 
     # Select the radio button
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", chosen_radio)
@@ -757,6 +932,191 @@ def open_and_choose_ship_to(
             log("[DEBUG] Radio button selected via JavaScript")
 
 
+def _dismiss_checkout_preloader(driver, timeout=25) -> None:
+    """Dismiss the fs-preloader 'Continue' overlay on the checkout page.
+
+    The overlay runs an inventory check (3-15s) and blocks every click until
+    its Continue button is pressed.  Safe to call when the overlay is absent.
+    """
+    try:
+        wait = WebDriverWait(driver, timeout)
+        wait.until(EC.presence_of_element_located((By.ID, "fs-preloader-1")))
+        continue_btn = wait.until(EC.visibility_of_element_located((
+            By.XPATH, "//div[@id='fs-preload-continue']//button[@onclick='preloadCloseWindow()']"
+        )))
+        try:
+            continue_btn.click()
+        except Exception:
+            try:
+                driver.execute_script("arguments[0].click();", continue_btn)
+            except Exception:
+                try:
+                    driver.execute_script("preloadCloseWindow();")
+                except Exception as e:
+                    log(f"[WARN] Could not dismiss checkout preloader: {e}")
+        time.sleep(1)
+        wait_for_overlay_gone(driver, timeout=10)
+        log("[INFO] Checkout preloader dismissed.")
+    except TimeoutException:
+        pass  # overlay never appeared — nothing to dismiss
+
+
+def open_and_choose_ship_to(
+    driver,
+    preferred_radio_id: str = None,
+    preferred_value_contains: str = None,
+    preferred_label_contains: str = None,
+    preferred_account_number: str = None,
+    max_retries: int = 5,
+):
+    """
+    Open the Ship-To modal and select the specified ship-to address.
+
+    Rewritten 2026-08-28 after catching the failure live:  the native click on
+    the Ship-To button is reliably intercepted on this page, and the old code
+    then fired a JS click as fallback — but the intercepted click had ALREADY
+    triggered the fancybox, so the fallback click toggled it closed again.
+    The old open-check saw the overlay during its brief open window, moved on,
+    and then waited forever for radios inside a closed modal ("Wrangler just
+    stops and moves on").
+
+    Fixes here:
+      - a SINGLE JS click per attempt (never native-then-JS double fire)
+      - modal-open and radios-VISIBLE are verified as one unit per attempt
+      - page refresh between attempts re-dismisses the inventory preloader
+      - only visible radios are considered for selection
+      - no silent fallback to an arbitrary radio
+    """
+    wait = WebDriverWait(driver, 25)
+
+    def _visible_radios():
+        out = []
+        try:
+            for r in driver.find_elements(By.CSS_SELECTOR, "input[name='add_addresses1']"):
+                try:
+                    if r.is_displayed() and (r.size or {}).get("height", 0) > 0:
+                        out.append(r)
+                except StaleElementReferenceException:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def _click_shipto_button():
+        try:
+            btn = wait.until(EC.presence_of_element_located((
+                By.CSS_SELECTOR, "button.pop-myShipTos-1, button[class*='pop-myShipTos']"
+            )))
+        except TimeoutException:
+            btn = wait.until(EC.presence_of_element_located((
+                By.XPATH, "//button[contains(., \"Available Ship-To\") or contains(., \"Ship-To\")]"
+            )))
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        driver.execute_script("arguments[0].click();", btn)   # single JS click only
+        log("[DEBUG] Ship-To button JS-clicked")
+
+    opened = False
+    for attempt in range(1, max_retries + 1):
+        log(f"[DEBUG] Ship-To modal attempt {attempt}/{max_retries}")
+        if _visible_radios():
+            opened = True
+            break
+        try:
+            _click_shipto_button()
+        except Exception as e:
+            log(f"[WARN] Could not click Ship-To button: {e}")
+        end = time.time() + 6
+        while time.time() < end:
+            if _visible_radios():
+                opened = True
+                break
+            time.sleep(0.25)
+        if opened:
+            break
+        log(f"[WARN] Ship-To modal not open with visible radios after attempt {attempt}.")
+        debug_dump(driver, f"modal_not_open_attempt_{attempt}")
+        if attempt < max_retries:
+            log("[INFO] Refreshing checkout page and retrying...")
+            driver.refresh()
+            time.sleep(4)
+            try:
+                WebDriverWait(driver, 15).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except TimeoutException:
+                pass
+            _dismiss_checkout_preloader(driver, timeout=20)
+            wait_for_overlay_gone(driver, timeout=10)
+            time.sleep(1)
+
+    if not opened:
+        raise TimeoutException(
+            "Ship-To modal never opened with visible radios after multiple attempts."
+        )
+    log("[DEBUG] Ship-To modal open — radios visible.")
+
+    # ── Select the requested radio (visible instances only) ──────────────────
+    all_radios = _visible_radios()
+    chosen_radio = None
+
+    for radio in all_radios:
+        radio_id = radio.get_attribute("id")
+        radio_val = radio.get_attribute("value") or ""
+        try:
+            label = driver.find_element(By.XPATH, f"//label[input[@id='{radio_id}']]")
+            label_text = label.text
+        except NoSuchElementException:
+            label_text = ""
+
+        if preferred_radio_id and radio_id == preferred_radio_id:
+            chosen_radio = radio
+            log(f"[INFO] Matched ship-to by radio ID: {radio_id}")
+            break
+        if preferred_value_contains and preferred_value_contains in radio_val:
+            chosen_radio = radio
+            log(f"[INFO] Matched ship-to by value substring: '{preferred_value_contains}'")
+            break
+        if preferred_label_contains and preferred_label_contains in label_text:
+            chosen_radio = radio
+            log(f"[INFO] Matched ship-to by label substring: '{preferred_label_contains}'")
+            break
+        if preferred_account_number and f"account_number={preferred_account_number}" in radio_val:
+            chosen_radio = radio
+            log(f"[INFO] Matched ship-to by account number: {preferred_account_number}")
+            break
+
+    if chosen_radio is None:
+        # Never gamble on an arbitrary ship-to — a wrong pick means the order
+        # ships/bills against the wrong account, silently.
+        debug_dump(driver, "shipto_no_match")
+        labels = []
+        for radio in all_radios[:10]:
+            try:
+                rid = radio.get_attribute("id")
+                lab = driver.find_element(By.XPATH, f"//label[input[@id='{rid}']]").text
+                labels.append(f"{rid}: {lab[:80]}")
+            except Exception:
+                continue
+        raise RuntimeError(
+            "No ship-to radio matched THE SOURCING GROUP criteria. "
+            f"Available options: {labels}"
+        )
+
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", chosen_radio)
+    if not chosen_radio.is_selected():
+        try:
+            safe_click(driver, chosen_radio)
+            log("[DEBUG] Radio button clicked successfully")
+        except Exception as e:
+            log(f"[WARN] Regular click failed: {e}, using JavaScript to select radio...")
+            driver.execute_script("""
+                arguments[0].checked = true;
+                arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
+                arguments[0].dispatchEvent(new Event('click', { bubbles: true }));
+            """, chosen_radio)
+            log("[DEBUG] Radio button selected via JavaScript")
+
+
 def fill_drop_ship_form(driver, shipto_data: dict):
     """
     Fill in the drop ship form with data from the CSV.
@@ -767,9 +1127,14 @@ def fill_drop_ship_form(driver, shipto_data: dict):
                      company, attention, street, city, state, zip
     """
     wait = WebDriverWait(driver, 15)
-    
+
     log("[INFO] Filling drop ship form...")
-    
+
+    # Required-field failures are collected and raised at the end — the old
+    # behaviour logged nine [WARN] lines when the form never even opened, then
+    # declared success and let a wrong/blank-address order sail on.
+    failed_required = []
+
     # 1. Set Country to United States
     try:
         country_select = wait.until(EC.element_to_be_clickable(
@@ -780,6 +1145,7 @@ def fill_drop_ship_form(driver, shipto_data: dict):
         time.sleep(1)  # Wait for state dropdown to populate
     except Exception as e:
         log(f"[WARN] Failed to set country: {e}")
+        failed_required.append("country")
     
     # 2. Fill Contact Name (Column K - shipToCompany)
     try:
@@ -794,6 +1160,7 @@ def fill_drop_ship_form(driver, shipto_data: dict):
             log(f"[INFO] Set contact name: {contact_name}")
     except Exception as e:
         log(f"[WARN] Failed to set contact name: {e}")
+        failed_required.append("contact name")
     
     # 3. Fill Address 1 (Column M - shipToStreet)
     try:
@@ -808,6 +1175,7 @@ def fill_drop_ship_form(driver, shipto_data: dict):
             log(f"[INFO] Set address 1: {street}")
     except Exception as e:
         log(f"[WARN] Failed to set address 1: {e}")
+        failed_required.append("street")
     
     # 4. Fill Address 2 (Column L - shipToAttention) - max 50 chars, can be blank
     try:
@@ -838,6 +1206,7 @@ def fill_drop_ship_form(driver, shipto_data: dict):
             log(f"[INFO] Set city: {city}")
     except Exception as e:
         log(f"[WARN] Failed to set city: {e}")
+        failed_required.append("city")
     
     # 6. Select State (Column O - shipToState)
     try:
@@ -852,6 +1221,7 @@ def fill_drop_ship_form(driver, shipto_data: dict):
             log(f"[INFO] Set state: {state_abbrev}")
     except Exception as e:
         log(f"[WARN] Failed to set state: {e}")
+        failed_required.append("state")
     
     # 7. Fill Zip Code (Column P - shipToZip)
     try:
@@ -868,6 +1238,7 @@ def fill_drop_ship_form(driver, shipto_data: dict):
             log(f"[INFO] Set zip code: {zipcode}")
     except Exception as e:
         log(f"[WARN] Failed to set zip code: {e}")
+        failed_required.append("zip")
     
     # 8. Fill Email field with required addresses
     try:
@@ -894,7 +1265,14 @@ def fill_drop_ship_form(driver, shipto_data: dict):
         log(f"[INFO] Set special instructions: {instructions_text}")
     except Exception as e:
         log(f"[WARN] Failed to set special instructions: {e}")
-    
+
+    if failed_required:
+        debug_dump(driver, "dropship_form_failed")
+        raise RuntimeError(
+            f"Drop ship form: required field(s) could not be filled: {', '.join(failed_required)}. "
+            "The form probably never opened — NOT submitting this order."
+        )
+
     log("[INFO] Drop ship form filled successfully")
 
 
@@ -1088,7 +1466,144 @@ def submit_checkout(driver, timeout=25):
         pass
 
 
-def checkout_and_ship(driver, po_number: str, client_po: str, shipto_data: dict = None):
+def capture_wrangler_order_id(driver, po_number: str, timeout: int = 30) -> str:
+    """Grab the vendor Order ID right after placement (added 2026-08-31).
+
+    After submit, Wrangler lands on an order page showing 'Order ID: <id>'
+    together with the PO.  Requiring BOTH on the page prevents grabbing some
+    other order's id.  Falls back to the Order History list (same lookup
+    GetOrderId.py uses).  Returns '' when nothing could be found — the
+    GetOrderId.py fallback pass can still fetch it later."""
+    po = str(po_number).strip()
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            body = driver.execute_script("return document.body.innerText") or ""
+        except Exception:
+            body = ""
+        if po and po in body:
+            m = re.search(r"Order ID:\s*([A-Za-z0-9]+)", body)
+            if m:
+                return m.group(1)
+        time.sleep(1.0)
+
+    log("[INFO] Order ID not on the post-submit page — checking Order History...")
+    try:
+        driver.get(ORDER_HISTORY_URL)
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "li.TD-row")))
+        block = driver.find_element(
+            By.XPATH,
+            f"//li[contains(@class,'TD-row') and .//span[em[text()='PO#:'] and contains(., '{po}')]]")
+        sid = block.find_element(By.XPATH, ".//span[em[text()='Order ID:']]").text
+        return sid.replace("Order ID:", "").strip()
+    except Exception as e:
+        log(f"[WARN] Could not find Order ID in Order History either: {type(e).__name__}")
+        return ""
+
+
+def update_order_id_in_excel(excel_path: str, row_index: int, order_id: str) -> bool:
+    """Append the vendor Order ID to column M (split orders may hold several
+    vendors' IDs, so never overwrite).  Retries around Excel file locks and
+    falls back to order_ids_fallback.txt so a placed order's ID is never lost."""
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            wb = load_workbook(excel_path)
+            ws = wb.active
+            cell = ws.cell(row=row_index + 2, column=13)  # +2: header row, 1-based
+            existing = coerce_str(cell.value)
+            if order_id in existing.split():
+                log(f"[INFO] Order ID {order_id} already recorded in column M.")
+                return True
+            cell.value = f"{existing} {order_id}".strip()
+            wb.save(excel_path)
+            log(f"[OK] Column M updated with Wrangler Order ID: {order_id}")
+            return True
+        except Exception as e:
+            last_err = e
+            log(f"[ERROR] Failed to update Excel (attempt {attempt}): {e}")
+            time.sleep(2)
+    try:
+        fallback = os.path.join(SCRIPT_DIR, "order_ids_fallback.txt")
+        with open(fallback, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  row={row_index + 2}  order_id={order_id}\n")
+        log(f"[WARN] Excel locked/unwritable — Order ID saved to {fallback}")
+    except Exception as e2:
+        log(f"[ERROR] Could not write fallback order-id file either: {e2} (original: {last_err})")
+    return False
+
+
+def verify_order_submitted(driver, timeout=60) -> None:
+    """Confirm the checkout actually went through before declaring success.
+
+    The old flow clicked Submit and reported '[OK] Order placed' with no
+    verification at all — a silently failed submit looked identical to a
+    placed order ("Wrangler just stops and moves on").
+
+    Success signals (either):
+      - the browser navigated away from the checkout page (receipt page), or
+      - the Submit Order button is gone/hidden with no loading overlay,
+        on two consecutive polls (page content replaced in place).
+    An error banner, or neither signal within `timeout`, raises.
+    """
+    log("[INFO] Verifying the order actually submitted...")
+    end = time.time() + timeout
+    quiet_polls = 0
+    while time.time() < end:
+        # Error banner → definite failure
+        try:
+            err = driver.find_element(By.ID, "submit_order_error_text")
+            if driver.execute_script(
+                "return window.getComputedStyle(arguments[0]).display !== 'none';", err
+            ):
+                debug_dump(driver, "submit_error_banner")
+                raise RuntimeError("Wrangler shows a submit-order error banner — order NOT placed.")
+        except NoSuchElementException:
+            pass
+
+        url = (driver.current_url or "")
+        if "tp_checkout" not in url:
+            log(f"[OK] Left the checkout page (now at {url}) — order submitted.")
+            return
+
+        # Still on a tp_checkout URL (receipt can share it): check whether the
+        # submit button is gone and nothing is still loading.
+        try:
+            btns = driver.find_elements(By.ID, "submit_order") or driver.find_elements(
+                By.XPATH,
+                "//button[contains(@onclick,'validate_checkout_form') or contains(@onclick,'ecat_submit_order')]",
+            )
+            submit_visible = any(b.is_displayed() for b in btns)
+        except Exception:
+            submit_visible = False
+        try:
+            overlays = driver.find_elements(
+                By.CSS_SELECTOR,
+                ".fancybox-overlay, .blockUI, .loading-overlay, [id^='fs-preloader']",
+            )
+            overlay_visible = any(o.is_displayed() for o in overlays)
+        except Exception:
+            overlay_visible = False
+
+        if not submit_visible and not overlay_visible:
+            quiet_polls += 1
+            if quiet_polls >= 2:
+                log("[OK] Submit button gone and page settled — order submitted.")
+                return
+        else:
+            quiet_polls = 0
+        time.sleep(1.0)
+
+    debug_dump(driver, "submit_unverified")
+    raise RuntimeError(
+        f"Could not confirm the order submitted within {timeout}s — still on the "
+        "checkout page with the Submit button visible. NOT counting this order as placed."
+    )
+
+
+def checkout_and_ship(driver, po_number: str, client_po: str, shipto_data: dict = None,
+                      expected_units: int = None):
     """
     Navigate to checkout and handle ship-to selection based on address:
     - If default Sourcing Group address: select radio and proceed normally
@@ -1224,7 +1739,9 @@ def checkout_and_ship(driver, po_number: str, client_po: str, shipto_data: dict 
         wait_for_overlay_gone(driver, timeout=20)
         time.sleep(1)
         
-        # Step 3: Click Drop Ship button
+        # Step 3: Click Drop Ship button — this MUST succeed for a non-default
+        # address; warning-and-continuing here is how orders went out against
+        # the wrong ship-to.
         try:
             drop_ship_btn = wait.until(EC.element_to_be_clickable((
                 By.XPATH, "//button[@onclick='BTNaddNewShipToAddress()']"
@@ -1234,7 +1751,11 @@ def checkout_and_ship(driver, po_number: str, client_po: str, shipto_data: dict 
             log("[INFO] Clicked Drop Ship button")
             time.sleep(1)
         except TimeoutException:
-            log("[WARN] Could not find Drop Ship button")
+            debug_dump(driver, "dropship_btn_missing")
+            raise RuntimeError(
+                "Drop Ship button never became clickable — cannot enter the "
+                "drop-ship address for this order."
+            )
         
         # Step 4: Fill in the drop ship form
         fill_drop_ship_form(driver, shipto_data)
@@ -1263,9 +1784,15 @@ def checkout_and_ship(driver, po_number: str, client_po: str, shipto_data: dict 
             except TimeoutException:
                 driver.execute_script("arguments[0].value = arguments[1];", inp, po_number)
     
+    # FINAL QUANTITY GATE: the checkout badge must still match the upload
+    # file exactly.  This is the last line of defense against doubled orders.
+    if expected_units is not None:
+        verify_wrangler_pad(driver, expected_units, "final pre-submit", settle_timeout=15)
+
     # Auto-submit the order
     log(f"[INFO] Submitting order for PO '{po_number}' (Client PO {client_po})...")
     submit_checkout(driver, timeout=25)
+    verify_order_submitted(driver, timeout=60)
     log(f"[OK] Order submitted successfully!")
     time.sleep(0.5)
 
@@ -1286,10 +1813,20 @@ def main():
     cleanup_old_debug_files()
     log("")
     
-    driver = webdriver.Chrome()
+    options = webdriver.ChromeOptions()
+    if TSG_DEBUG:
+        options.add_argument(f"--remote-debugging-port={DEBUG_PORT}")
+        log(f"[DEBUG] TSG_DEBUG on — Chrome DevTools will listen on 127.0.0.1:{DEBUG_PORT}")
+    driver = webdriver.Chrome(options=options)
     try:
         log("[INFO] Logging in to Wrangler B2B...")
-        login(driver)
+        try:
+            login(driver)
+        except Exception as e:
+            log(f"[ERROR] Wrangler login failed: {e}")
+            debug_dump(driver, "login_failed")
+            debug_hold(driver, f"Login failed: {e}")
+            raise
         log("[OK] Login successful!")
         
         log("[INFO] Loading Excel file...")
@@ -1299,8 +1836,10 @@ def main():
         col_j = df.columns[9]   # the raw order field
         col_k = df.columns[10]  # brand column – only process rows containing "Wrangler"
 
-        # Filter to only rows where column K contains "Wrangler" (case-insensitive)
-        df = df[df[col_k].fillna("").str.contains("Wrangler", case=False, na=False)].reset_index(drop=True)
+        # Filter to only rows where column K contains "Wrangler" (case-insensitive).
+        # NOTE: original sheet indices are kept (no reset_index) — they are what
+        # update_order_id_in_excel needs to hit the right row in column M.
+        df = df[df[col_k].fillna("").str.contains("Wrangler", case=False, na=False)]
 
         # track which row/index and PO we processed / skipped
         processed = []
@@ -1329,6 +1868,15 @@ def main():
             log(f"  - Client PO: {client_po}")
             log(f"  - Order File: {order_no}")
 
+            # CHECKPOINT: skip orders this vendor already placed (survives
+            # crashes/restarts; vendor-aware so split orders are safe).
+            prior = tsg_runlog.already_placed(SCRIPT_DIR, draft_name, "wrangler")
+            if prior:
+                log(f"[SKIP] {draft_name} already placed with Wrangler on {prior.get('when','?')} "
+                    f"(Order ID: {prior.get('order_id') or 'n/a'}).")
+                processed.append((idx, draft_name, client_po))
+                continue
+
             # Require ship-to data BEFORE touching the vendor site so a
             # missing address CSV can be fixed (Try Again) or the order
             # skipped cleanly from the TSG app.
@@ -1338,14 +1886,51 @@ def main():
                 log(f"[SKIP] Order {draft_name} (Client PO {client_po}) skipped — no address CSV.")
                 continue
 
-            open_order_menu(driver)
-            create_new_draft(driver, draft_name, ship_date)
-            upload_batch_order(driver, order_no)
-            checkout_and_ship(driver, draft_name, client_po, shipto_data)
+            try:
+                open_order_menu(driver)
+                create_new_draft(driver, draft_name, ship_date)
+
+                # CART GUARD: if the draft name already existed, the site just
+                # RESUMED that draft — leftover items and all.  Clear before
+                # uploading so quantities can never stack across restarts.
+                ensure_fresh_wrangler_pad(driver)
+
+                upload_path = upload_batch_order(driver, order_no)
+                expected_units = expected_units_from_upload_file(upload_path)
+                log(f"[INFO] Upload file expects {expected_units} unit(s).")
+                verify_wrangler_pad(driver, expected_units, "after upload")
+
+                checkout_and_ship(driver, draft_name, client_po, shipto_data,
+                                  expected_units=expected_units)
+            except Exception as e:
+                log(f"[ORDER_ERROR] {draft_name} (Client PO {client_po}): {e}")
+                import traceback as _tb
+                _tb.print_exc()
+                debug_dump(driver, f"order_{client_po}")
+                action = debug_hold(driver, f"Order {draft_name} failed mid-flow: {e}")
+                if action != "continue":
+                    raise
+                skipped.append((idx, draft_name, client_po))
+                continue
+
+            # Record the placement checkpoint IMMEDIATELY (before ID capture:
+            # even if the capture hiccups, a re-run must never re-place this).
+            tsg_runlog.record_placed(SCRIPT_DIR, draft_name, "wrangler")
+
+            # Capture the vendor Order ID right now instead of relying on the
+            # end-of-pipeline GetOrderId pass (which never runs if a later
+            # vendor script crashes).
+            order_id = capture_wrangler_order_id(driver, draft_name)
+            if order_id:
+                log(f"[OK] Wrangler Order ID captured at placement: {order_id}")
+                update_order_id_in_excel(EXCEL_PATH, idx, order_id)
+                tsg_runlog.record_placed(SCRIPT_DIR, draft_name, "wrangler", order_id)
+            else:
+                log("[WARN] Order ID not captured — the Get Order IDs step can still fetch it later.")
 
             processed.append((idx, draft_name, client_po))
             log(f"[OK] Order {draft_name} placed successfully!")
-            
+
             # Small pause between orders to let system settle
             time.sleep(2)
 

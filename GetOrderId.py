@@ -7,6 +7,8 @@ import pandas as pd
 
 from openpyxl import load_workbook
 
+import tsg_runlog
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -107,19 +109,32 @@ def main():
     col_k = df.columns[10]  # Vendor column
 
     wrangler_rows = []
+    already_captured = 0
     for idx, po in enumerate(df[col_g]):
         if not po or pd.isna(po):
             continue
         vendor_cell = str(df.at[idx, col_k]) if not pd.isna(df.at[idx, col_k]) else ""
         if "wrangler" in vendor_cell.lower():
+            # PMtoWRG now captures the Order ID at placement time and records
+            # it in the placement ledger — only look up the ones it missed.
+            prior = tsg_runlog.already_placed(SCRIPT_DIR, po, "wrangler")
+            if prior and prior.get("order_id"):
+                print(f"[{idx+1}/{len(df)}] Skipping PO {po} — Order ID {prior['order_id']} "
+                      "was already captured at placement.")
+                already_captured += 1
+                continue
             wrangler_rows.append((idx, po))
         else:
             print(f"[{idx+1}/{len(df)}] Skipping PO {po} — vendor '{vendor_cell}' does not include Wrangler")
 
     if not wrangler_rows:
         print("")
-        print("[INFO] No Wrangler orders found in Processed_orders.xlsx (column K).")
-        print("[INFO] Nothing to fetch — skipping Wrangler login.")
+        if already_captured:
+            print(f"[INFO] All {already_captured} Wrangler Order ID(s) were already captured at "
+                  "placement by PMtoWRG — nothing to fetch.")
+        else:
+            print("[INFO] No Wrangler orders found in Processed_orders.xlsx (column K).")
+        print("[INFO] Skipping Wrangler login entirely (no browser needed).")
         return
 
     driver = webdriver.Chrome()
@@ -173,7 +188,13 @@ def main():
         else:
             oid_col = 13  # column M ("Order Number in vendor system")
         for idx, oid in found.items():
-            ws.cell(row=idx + 2, column=oid_col).value = oid  # +2: header row + 1-based
+            cell = ws.cell(row=idx + 2, column=oid_col)  # +2: header row + 1-based
+            existing = str(cell.value).strip() if cell.value is not None else ""
+            # APPEND, never overwrite: on split orders (Propper / Wrangler in
+            # one row) column M may already hold the other vendor's ID.
+            if oid in existing.split():
+                continue
+            cell.value = f"{existing} {oid}".strip()
         wb.save(EXCEL_PATH)
         print(f"[OK] Saved updated Order IDs to {EXCEL_PATH}")
         print("="*60)

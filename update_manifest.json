@@ -1,11 +1,11 @@
 {
   "version": "1.0.0",
-  "updated": "2026-08-07",
+  "updated": "2026-08-31",
   "files": [
     {
       "name": "tsg_automate_app.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/tsg_automate_app.py",
-      "sha256": "1d46a53dfee880a98712b7f1a09d3570d32b3ab39ef4cf5a694e3334752c006e"
+      "sha256": "ce836b12861e84d34606b7e3c1cf607bb270d0c8a85b286924794049bb0cdf99"
     },
     {
       "name": "app_updater.py",
@@ -40,22 +40,32 @@
     {
       "name": "PMtoWRG.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoWRG.py",
-      "sha256": "86d4c137fd572a4aed29333c76d566c5813c68b21c842a7dfeeba41dedd7d722"
+      "sha256": "11b6fc762052c5acdee1352afe474f37e456663e435ceed77b9f6a1ad08a6447"
     },
     {
       "name": "PMtoARIAT.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoARIAT.py",
-      "sha256": "431e52cef47ad5927309355a3a480d7ad69bf5e57bd1ccab96a4d26ea896f370"
+      "sha256": "a44688c6f3da7f8873ff0317fd5899489306fd350d8ed4b20352b7c48b977c08"
     },
     {
       "name": "PMtoPropper.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoPropper.py",
-      "sha256": "13d554298a6c3080185188d87bdd3091a90660109dc4d37d7d8308386c7a632b"
+      "sha256": "4900c7c7c7641eb118ce59b79a4d9fa2bc9c6b9864a53c6831b814f1e836fb09"
     },
     {
       "name": "GetOrderId.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/GetOrderId.py",
-      "sha256": "b698badf3693f954e449a0c319a567d74a681ec88899509b82c10b62fdc6fc2b"
+      "sha256": "fb2d439f89aafc187bccf2ba4c8c78e8c1807aa58f0f32a1242a8014e21fa307"
+    },
+    {
+      "name": "tsg_runlog.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/tsg_runlog.py",
+      "sha256": "364d69b625bdd623f189e6e0cc096b2638fb4b9d2a7c46067427e65974903628"
+    },
+    {
+      "name": "debug_inspect.py",
+      "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/debug_inspect.py",
+      "sha256": "74b378ba03cf779bfab6a52208450a62bc48047956f04bda0fb155a9d73bd300"
     }
   ]
 }

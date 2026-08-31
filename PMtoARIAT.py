@@ -4,8 +4,12 @@ import sys
 import glob
 import time
 import math
+import datetime
+import traceback
 import pandas as pd
 from openpyxl import load_workbook
+
+import tsg_runlog
 
 # Make stdout/stderr robust to non-UTF-8 consoles (e.g. Windows cp1252 when this
 # script is launched standalone or with its output redirected).  Without this a
@@ -47,6 +51,249 @@ ARIAT_PASSWORD  = os.getenv("ARIAT_PASSWORD", "5Wft87ptvX68h3h")
 WAIT_LONG  = 90
 WAIT_MED   = 30
 WAIT_SHORT = 10
+
+# Debug mode: set TSG_DEBUG=1 to (a) expose Chrome DevTools on port 9222 so an
+# external tool can attach and inspect the live page, (b) dump a screenshot +
+# HTML on any failure, and (c) HOLD the browser open on errors instead of
+# crashing out, so the failing page state can be examined.
+TSG_DEBUG = os.getenv("TSG_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
+DEBUG_PORT = 9222
+# ────────────────────────────────────────────────────────────────────────────────
+
+
+def debug_dump(driver, error_name="error"):
+    """Save a screenshot + page HTML + URL so a failure can be diagnosed later."""
+    try:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        png = os.path.join(SCRIPT_DIR, f"debug_ariat_{error_name}_{ts}.png")
+        html = os.path.join(SCRIPT_DIR, f"debug_ariat_{error_name}_{ts}.html")
+        driver.save_screenshot(png)
+        print(f"[DEBUG] Screenshot saved: {png}")
+        with open(html, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        print(f"[DEBUG] HTML saved: {html}")
+        print(f"[DEBUG] URL at failure: {driver.current_url}")
+    except Exception as e:
+        print(f"[DEBUG] Failed to save debug info: {e}")
+
+
+def debug_hold(driver, context=""):
+    """In TSG_DEBUG mode, keep the browser open and wait for instructions on stdin.
+
+    Returns 'continue' (move on to the next order) or 'abort' (end the run).
+    In normal mode returns 'abort' immediately, preserving fail-fast behaviour —
+    continuing past a half-finished order risks a dirty cart contaminating the
+    next order, so that decision is only offered to a human in debug mode.
+    """
+    if not TSG_DEBUG:
+        return "abort"
+    print("")
+    print(f"[DEBUG_HOLD] {context}")
+    print(f"[DEBUG_HOLD] Browser held open (DevTools on 127.0.0.1:{DEBUG_PORT}).")
+    print("[DEBUG_HOLD] Type 'continue' to move to the next order, or 'abort' to end the run.")
+    while True:
+        try:
+            resp = input().strip().lower()
+        except EOFError:
+            return "abort"
+        if resp == "continue":
+            print("[DEBUG_HOLD] Continuing with the next order.")
+            return "continue"
+        if resp == "abort":
+            print("[DEBUG_HOLD] Aborting the run.")
+            return "abort"
+        if resp:
+            print(f"[DEBUG_HOLD] Unrecognized input '{resp}' — type 'continue' or 'abort'.")
+
+
+def _find_displayed(driver, by, sel, timeout=WAIT_MED, context=""):
+    """Return the first VISIBLE element matching sel.
+
+    Unlike EC.visibility_of_element_located, this scans ALL matches each poll.
+    Dojo keeps the previous order's dialogs/buttons hidden in the DOM, so after
+    the first order a first-match lookup often lands on a stale hidden node and
+    times out (or worse, reads stale text) even though a fresh visible instance
+    exists further down the DOM.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        for e in driver.find_elements(by, sel):
+            try:
+                if e.is_displayed():
+                    return e
+            except Exception:
+                continue
+        time.sleep(0.25)
+    raise TimeoutException(f"No VISIBLE element matching {sel!r} within {timeout}s. {context}")
+
+
+def _any_displayed(driver, by, sel) -> bool:
+    """True if at least one element matching sel is currently visible."""
+    try:
+        return any(e.is_displayed() for e in driver.find_elements(by, sel))
+    except Exception:
+        return False
+
+
+def _wait_none_displayed(driver, by, sel, timeout=WAIT_MED) -> bool:
+    """Wait until NO element matching sel is visible. True on success."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if not _any_displayed(driver, by, sel):
+            return True
+        time.sleep(0.25)
+    return False
+# ────────────────────────────────────────────────────────────────────────────────
+
+
+# ─── CART VERIFICATION & SELF-HEALING (added 2026-08-31) ──────────────────────
+# Root cause of the doubled-quantity orders: Ariat persists the working draft
+# server-side.  A crashed run leaves its items in the draft; the next login
+# resumes that SAME draft and the fresh import stacks on top (1 leftover unit +
+# 1 imported unit = order placed with 2).  These helpers make every order
+# (a) start from a provably empty cart and (b) refuse to submit when the cart
+# quantity does not exactly match the upload file.
+
+def expected_units_from_upload(path: str) -> int:
+    """Sum the qty column of an Ariat/Carhartt upload workbook (upc, qty)."""
+    df = pd.read_excel(path, dtype=str)
+    qty_col = None
+    for c in df.columns:
+        if str(c).strip().lower() in ("qty", "quantity", "units"):
+            qty_col = c
+            break
+    if qty_col is None:
+        qty_col = df.columns[1]  # historical layout: A=upc, B=qty
+    total = 0
+    for v in df[qty_col]:
+        s = coerce_str(v)
+        if s.isdigit():
+            total += int(s)
+    return total
+
+
+def ariat_cart_units(driver) -> int:
+    """Read the unit count from the header cart badge ('N Units / $..')."""
+    try:
+        txt = driver.execute_script("return document.body.innerText") or ""
+    except Exception:
+        return -1
+    m = re.search(r"(\d+)\s*Units\s*/", txt)
+    return int(m.group(1)) if m else -1
+
+
+def open_main_menu_v2(driver, timeout=WAIT_MED):
+    """Open the builder Menu via Dojo's own dropdown API.
+
+    The old click-strategy ladder still exists as a fallback, but the widget
+    API is deterministic — and immune to the stuck popupactive='true'
+    attribute that makes is_main_menu_open() lie after the menu has been used
+    once in the same shell.
+    """
+    opened = driver.execute_script("""
+        var t=[...document.querySelectorAll('div.mainMenu')].filter(e=>e.offsetParent)[0];
+        if(!t || !window.dijit || !dijit.registry) return false;
+        var w = dijit.registry.getEnclosingWidget(t);
+        var probe = w, hops = 0;
+        while (probe && hops < 4) {
+            if (probe.openDropDown) { probe.openDropDown(); return true; }
+            probe = dijit.registry.getEnclosingWidget(probe.domNode.parentNode);
+            hops++;
+        }
+        return false;
+    """)
+    if opened:
+        end = time.time() + 5
+        while time.time() < end:
+            if _any_displayed(driver, By.CSS_SELECTOR, "td.dijitMenuItemLabel"):
+                return
+            time.sleep(0.2)
+    # Fallback: the historical strategy ladder
+    open_main_menu(driver, timeout=timeout)
+
+
+def click_menu_item(driver, label: str, timeout=WAIT_MED):
+    """Click a VISIBLE main-menu item by its label text."""
+    open_main_menu_v2(driver, timeout=timeout)
+    item = _find_displayed(
+        driver, By.XPATH,
+        f"//td[contains(@class,'dijitMenuItemLabel') and normalize-space()='{label}']",
+        timeout=timeout, context=f"(menu item '{label}')")
+    safe_click(driver, item)
+
+
+def ensure_fresh_ariat_order(driver):
+    """Guarantee the builder holds an EMPTY cart before an import.
+
+    If the resumed draft has leftover units (crashed previous run), discard it:
+    Menu -> New Order -> 'Don't Save' (drops to the marketing page) -> re-enter
+    the builder -> confirm 0 units.  Verified live 2026-08-31.
+    """
+    # Stability poll: right after the shell loads the badge can briefly read 0
+    # before the resumed draft's real units render — trust a value only once
+    # two consecutive 1s-apart reads agree (max ~6s, usually ~2s).
+    units = ariat_cart_units(driver)
+    end = time.time() + 6
+    while time.time() < end:
+        time.sleep(1.0)
+        cur = ariat_cart_units(driver)
+        if cur == units and cur >= 0:
+            break
+        units = cur
+    if units == 0:
+        print("[INFO] Cart check: builder cart is empty — OK to import.")
+        return
+    print(f"[CART_GUARD] Builder cart has {units} leftover unit(s) from a previous run!")
+    print("[CART_GUARD] Discarding the dirty draft via Menu -> New Order -> Don't Save...")
+    debug_dump(driver, "leftover_cart_before_discard")
+
+    click_menu_item(driver, "New Order", timeout=WAIT_MED)
+    # Confirm dialog: "Your order has not been saved..." -> Don't Save
+    try:
+        btn = _find_displayed(
+            driver, By.XPATH,
+            "//button[normalize-space()=\"Don't Save\"] | "
+            "//span[contains(@class,'dijitButtonText') and normalize-space()=\"Don't Save\"]/ancestor::*[@role='button'][1]",
+            timeout=WAIT_SHORT, context="(New Order confirm dialog)")
+        safe_click(driver, btn)
+        print("[CART_GUARD] Clicked \"Don't Save\" — dirty draft discarded.")
+    except TimeoutException:
+        print("[CART_GUARD] No confirm dialog appeared (draft may have been clean-saved).")
+
+    time.sleep(2.0)
+    enter_order_builder(driver, timeout=WAIT_LONG)
+    wait_ready(driver)
+    time.sleep(1.0)
+
+    units = ariat_cart_units(driver)
+    if units != 0:
+        debug_dump(driver, "cart_not_empty_after_discard")
+        raise RuntimeError(
+            f"Cart still shows {units} unit(s) after discarding the draft — refusing to import."
+        )
+    print("[CART_GUARD] Fresh order confirmed: cart is empty.")
+
+
+def verify_ariat_cart(driver, expected_units: int, context: str, settle_timeout: int = 30):
+    """Hard gate: header-badge units must EXACTLY match the upload file.
+
+    Polls up to settle_timeout — the badge updates a few seconds AFTER the
+    import dialog closes (server round-trip), so a single immediate read can
+    race and report 0 (observed live 2026-08-31)."""
+    end = time.time() + settle_timeout
+    units = -1
+    while time.time() < end:
+        units = ariat_cart_units(driver)
+        if units == expected_units:
+            print(f"[CART_VERIFY] OK ({context}): cart has {units} unit(s), expected {expected_units}.")
+            return
+        time.sleep(1.0)
+    debug_dump(driver, f"cart_mismatch_{context.replace(' ', '_')}")
+    raise RuntimeError(
+        f"CART MISMATCH ({context}): cart shows {units} unit(s) but the upload file "
+        f"contains {expected_units} (waited {settle_timeout}s). A leftover/dirty cart "
+        "would double-order — NOT proceeding."
+    )
 # ────────────────────────────────────────────────────────────────────────────────
 
 
@@ -60,6 +307,14 @@ US_STATE_ABBR_TO_NAME = {
     "SD":"South Dakota","TN":"Tennessee","TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington",
     "WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming","DC":"District of Columbia",
 }
+
+
+def _short_err(e) -> str:
+    """First line of an exception message — WebDriver errors append a full
+    chromedriver stacktrace to str(e), which drowned the logs on every
+    expected-failure click attempt."""
+    s = str(e).strip()
+    return s.splitlines()[0] if s else type(e).__name__
 
 
 def coerce_str(val) -> str:
@@ -251,10 +506,12 @@ def is_main_menu_open(driver) -> bool:
     Multiple signals exist because Dojo's ARIA bookkeeping isn't always
     consistent (e.g. popupactive='true' alongside aria-expanded='false').
     """
-    # 1) popupactive attribute on the trigger — fastest and most reliable
+    # 1) any visible menu-item label — the only signal that cannot lie.
+    #    (The old first signal trusted the trigger's popupactive attribute,
+    #    but Dojo leaves it stuck on 'true' after the menu has been used once,
+    #    so open_main_menu() no-opped on every later call in the same shell.)
     try:
-        trig = driver.find_element(By.ID, MAIN_MENU_TRIGGER_ID)
-        if (trig.get_attribute("popupactive") or "").lower() == "true":
+        if any(e.is_displayed() for e in driver.find_elements(By.CSS_SELECTOR, "td.dijitMenuItemLabel")):
             return True
     except Exception:
         pass
@@ -429,7 +686,7 @@ def open_main_menu(driver, timeout=WAIT_LONG):
                 action()
             except Exception as e:
                 last_err = e
-                print(f"[WARN] open_main_menu: strategy '{name}' raised: {e}")
+                print(f"[WARN] open_main_menu: strategy '{name}' raised: {_short_err(e)}")
                 continue
 
             if _wait_open(sec=2.0):
@@ -475,12 +732,46 @@ def click_import_a_file(driver, timeout=WAIT_LONG):
     We try each with several click methods and detect success by waiting
     for the import dialog's "Paste From Clipboard" control to appear.
     """
-    open_main_menu(driver, timeout=timeout)
-    time.sleep(0.4)  # let menu items finish rendering after popup opens
-
     _DIALOG_SIGNAL_XPATH = (
         "//*[contains(@class,'singleValue') and normalize-space()='Paste From Clipboard']"
     )
+
+    def _dialog_open_now() -> bool:
+        try:
+            return any(e.is_displayed() for e in driver.find_elements(By.XPATH, _DIALOG_SIGNAL_XPATH))
+        except Exception:
+            return False
+
+    # ── FAST PATH (2026-08-31) ────────────────────────────────────────────────
+    # Open the menu via Dojo's own dropdown API and JS-click the visible label:
+    # the exact combination that succeeded on every observed run.  The legacy
+    # ladder below fired native clicks while the menu was still animating,
+    # which double-toggled it closed and burned 10-15s of per-strategy waits
+    # (plus stacktrace spam) on every single order.
+    for attempt in (1, 2):
+        try:
+            open_main_menu_v2(driver, timeout=WAIT_MED)
+            label = _find_displayed(
+                driver, By.XPATH,
+                "//tr[contains(@class,'import_csv')]//td[contains(@class,'dijitMenuItemLabel')]"
+                " | //td[contains(@class,'dijitMenuItemLabel') and normalize-space()='Import a File']",
+                timeout=8, context="(Import a File label)")
+            driver.execute_script("arguments[0].click();", label)
+        except Exception as e:
+            print(f"[WARN] click_import_a_file: fast path attempt {attempt} raised: {_short_err(e)}")
+            continue
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            if _dialog_open_now():
+                print("[INFO] click_import_a_file: dialog opened (fast path)")
+                return
+            time.sleep(0.15)
+        print(f"[WARN] click_import_a_file: fast path attempt {attempt} did not open the dialog")
+
+    print("[WARN] click_import_a_file: falling back to the legacy click ladder")
+    # ── LEGACY LADDER (fallback) ──────────────────────────────────────────────
+    open_main_menu(driver, timeout=timeout)
+    time.sleep(0.4)  # let menu items finish rendering after popup opens
     _ROW_SELECTORS = [
         (By.CSS_SELECTOR, "tr.import_csv"),
         (By.XPATH,        "//tr[contains(@class,'import_csv')]"),
@@ -570,7 +861,7 @@ def click_import_a_file(driver, timeout=WAIT_LONG):
         try:
             action(target)
         except Exception as e:
-            print(f"[WARN] click_import_a_file: '{name}' raised: {e}")
+            print(f"[WARN] click_import_a_file: '{name}' raised: {_short_err(e)}")
             continue
 
         # Give the dialog up to 4s to appear after the click
@@ -1113,7 +1404,10 @@ def login_and_land(driver):
     wait_ready(driver)
     time.sleep(1.5)   # let Dojo finish widget registration before we interact
 
-    wait_for_import_menu_item(driver, timeout=WAIT_LONG)
+    # NOTE (2026-08-31): the old code opened the Menu here just to verify the
+    # 'Import a File' item exists, then the first order re-opened it — a
+    # redundant open (and ladder run) that also left the menu dangling.  The
+    # shell-ready check above plus the import step's own menu handling cover it.
 
 
 def import_file_flow(driver, upload_path: str):
@@ -1196,6 +1490,83 @@ def _dismiss_sales_programs_modal(driver, timeout=WAIT_SHORT) -> bool:
     return False
 
 
+# ─── 'PRODUCT AVAILABILITY ISSUE' (CANCEL DATE) POPUP ─────────────────────────
+# On back-orders, some items become available only AFTER the shipment's cancel
+# date; Ariat then pops this modal at checkout, which blocks everything under
+# it (this froze/killed the 2026-08-31 back-order run for PO 168818-310482).
+# Policy (per MY): always choose the FURTHER-OUT cancel date, then Save.
+_AVAIL_MODAL_XPATH = (
+    "//div[contains(@class,'ReactModal__Content')]"
+    "[.//*[contains(normalize-space(.),'Product Availability Issue')]]"
+)
+
+
+def handle_availability_cancel_date_popup(driver, timeout=WAIT_SHORT) -> bool:
+    """If the cancel-date modal is showing (or appears within `timeout`),
+    select the LATEST date in every shipment's radio group and Save.
+
+    Radio values are ISO dates ('2026-12-14'), grouped per shipment via the
+    radio name ('Shipment 1', ...), so a lexicographic max is the latest date.
+    Returns True if a modal was handled."""
+    end = time.time() + timeout
+    modal = None
+    while time.time() < end:
+        for m in driver.find_elements(By.XPATH, _AVAIL_MODAL_XPATH):
+            try:
+                if m.is_displayed():
+                    modal = m
+                    break
+            except Exception:
+                continue
+        if modal is not None:
+            break
+        time.sleep(0.3)
+    if modal is None:
+        return False
+
+    print("[INFO] 'Product Availability Issue' popup detected — selecting the further-out cancel date(s).")
+    picked = driver.execute_script("""
+        var modal = arguments[0];
+        var groups = {};
+        modal.querySelectorAll('input[type=radio]').forEach(function(r){
+            (groups[r.name] = groups[r.name] || []).push(r);
+        });
+        var out = [];
+        Object.keys(groups).forEach(function(name){
+            var radios = groups[name].slice().sort(function(a, b){
+                return String(a.value || '').localeCompare(String(b.value || ''));
+            });
+            var latest = radios[radios.length - 1];
+            if (latest && !latest.checked) latest.click();
+            if (latest) out.push(name + ' -> ' + latest.value);
+        });
+        return out;
+    """, modal)
+    for line in picked or []:
+        print(f"[INFO] Cancel date choice: {line}")
+    time.sleep(0.5)
+
+    # The radio click triggers a React re-render, which STALES the old modal
+    # element handle (observed live) — re-locate the visible modal fresh and
+    # click Save inside it.
+    try:
+        save_btn = _find_displayed(
+            driver, By.XPATH,
+            _AVAIL_MODAL_XPATH + "//button[normalize-space()='Save']",
+            timeout=WAIT_SHORT, context="(cancel-date Save button)")
+        safe_click(driver, save_btn)
+        print("[INFO] Clicked Save on the cancel-date popup.")
+    except Exception as e:
+        debug_dump(driver, "cancel_date_save_missing")
+        raise RuntimeError(f"Cancel-date popup shown but its Save button was not clickable: {_short_err(e)}")
+
+    if _wait_none_displayed(driver, By.XPATH, _AVAIL_MODAL_XPATH, timeout=WAIT_MED):
+        print("[INFO] Cancel-date popup closed.")
+    else:
+        print("[WARN] Cancel-date popup still visible after Save.")
+    return True
+
+
 def proceed_to_checkout_flow(driver):
     # Step 1: 'Proceed to Checkout' on the order page (Dojo proceedBtn) -> cart.
     try:
@@ -1211,11 +1582,16 @@ def proceed_to_checkout_flow(driver):
     # Step 2: 'Proceed to Checkout' on the cart page (React button) -> this is
     # what opens the optional Sales Programs modal.  Stop clicking as soon as the
     # modal appears or we've already reached shipping (drop-ship button present).
+    # NOTE: visibility check, not presence — after the first order Dojo keeps a
+    # stale hidden btnDropShip in the DOM, which made presence checks think we
+    # had already reached shipping on the second order.
     for _ in range(3):
-        if _sales_programs_modal_present(driver) or driver.find_elements(By.CSS_SELECTOR, "span.btnDropShip"):
+        if _sales_programs_modal_present(driver) or _any_displayed(driver, By.CSS_SELECTOR, "span.btnDropShip"):
             break
         try:
-            click_button_by_text(driver, "Proceed to Checkout", timeout=WAIT_MED)
+            # 8s bound (was 30): the loop itself retries, so a long per-try
+            # wait only stretched the rare worst case.
+            click_button_by_text(driver, "Proceed to Checkout", timeout=8)
         except TimeoutException:
             pass
         time.sleep(1.0)
@@ -1225,7 +1601,11 @@ def proceed_to_checkout_flow(driver):
     # modal / re-clicking Proceed until the drop-ship button is present.
     end = time.time() + WAIT_LONG
     while time.time() < end:
-        if driver.find_elements(By.CSS_SELECTOR, "span.btnDropShip"):
+        if _any_displayed(driver, By.CSS_SELECTOR, "span.btnDropShip"):
+            # Back-orders: the cancel-date modal can arrive with the checkout
+            # page and blocks everything below it — resolve it before we
+            # declare the checkout ready.
+            handle_availability_cancel_date_popup(driver, timeout=3)
             return
         if _sales_programs_modal_present(driver):
             _dismiss_sales_programs_modal(driver, timeout=WAIT_SHORT)
@@ -1346,12 +1726,22 @@ def fill_drop_ship_address(driver, po_number: str, addr: dict = None):
     if addr is None:
         addr = load_shipto_from_po_csv(po_number)
 
-    wait_and_click(driver, By.CSS_SELECTOR, "span.btnDropShip", timeout=WAIT_LONG)
+    # Defensive: a late-arriving cancel-date modal would block the drop-ship
+    # form from opening (exact failure of the 2026-08-31 back-order run).
+    handle_availability_cancel_date_popup(driver, timeout=2)
+
+    # Displayed-aware lookup: a hidden stale btnDropShip from the previous
+    # order must not be the click target.
+    ds_btn = _find_displayed(driver, By.CSS_SELECTOR, "span.btnDropShip",
+                             timeout=WAIT_LONG, context="(drop-ship button)")
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", ds_btn)
+    safe_click(driver, ds_btn)
 
     def fill_by_input_name(input_name: str, value: str):
         if not value:
             return
-        inp = wait_visible(driver, By.CSS_SELECTOR, f"input[name='{input_name}']", timeout=WAIT_LONG)
+        inp = _find_displayed(driver, By.CSS_SELECTOR, f"input[name='{input_name}']",
+                              timeout=WAIT_LONG, context=f"(drop-ship field '{input_name}')")
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
         inp.clear()
         inp.send_keys(value)
@@ -1364,42 +1754,71 @@ def fill_drop_ship_address(driver, po_number: str, addr: dict = None):
     state_ab = addr["state_abbr"]
     state_name = US_STATE_ABBR_TO_NAME.get(state_ab, "")
     if state_name:
-        try:
-            wait_and_click(driver, By.XPATH, "//span[contains(@class,'dijitSelect') and contains(@class,'state')]", timeout=WAIT_LONG)
-        except TimeoutException:
-            wait_and_click(driver, By.XPATH, "//*[normalize-space()='State']/following::span[contains(@class,'dijitSelect')][1]", timeout=WAIT_LONG)
+        # Displayed-aware: the previous order's drop-ship modal (state dropdown
+        # AND its popup menu items) lingers hidden in the DOM, so first-match
+        # waits bound to the stale copy and timed out.  Confirmed live on
+        # 2026-08-28: order 2's visible dropdown said 'select...' while a
+        # hidden 'Louisiana' copy from order 1 soaked up every click attempt.
+        st = _find_displayed(driver, By.CSS_SELECTOR, "span.dijitSelect.state",
+                             timeout=WAIT_LONG, context="(state dropdown)")
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", st)
+        safe_click(driver, st)
 
-        wait_and_click(
-            driver,
-            By.XPATH,
+        item = _find_displayed(
+            driver, By.XPATH,
             f"//td[contains(@class,'dijitMenuItemLabel') and normalize-space()='{state_name}']",
-            timeout=WAIT_LONG
-        )
+            timeout=WAIT_LONG, context=f"(state menu item '{state_name}')")
+        safe_click(driver, item)
     else:
         print(f"[WARN] Unknown/blank state abbreviation '{state_ab}' for PO {po_number}. Please select state manually.")
 
     # ✅ Save (Dijit) - click the actual button node, not just the inner text span
     click_dijit_button_by_label(driver, "Save", timeout=WAIT_LONG, prefer_id="dijit_form_Button_40")
 
-    # ✅ If the site cannot validate the address it shows a dijitTextBoxError warning
-    # and requires a second Save click to confirm and proceed anyway.
-    warning_bypassed = _handle_address_validation_warning(driver)
-
-    # ✅ Handle the address confirmation popup that appears after saving.
-    # When the validation warning was bypassed the React confirmation modal rarely
-    # appears, so use a short timeout (10 s) to avoid a 90-second stall.
-    popup_timeout = WAIT_SHORT if warning_bypassed else WAIT_LONG
-    handle_address_confirmation_popup(driver, timeout=popup_timeout)
+    # ✅ Combined post-Save poll (2026-08-31): wait for whichever comes FIRST —
+    #    (a) the address-validation warning (needs a second Save to confirm),
+    #    (b) the React 'Confirm Address' modal (pick suggested address),
+    #    (c) the form simply closing (address accepted silently).
+    #    The old sequence always burned a fixed 6s waiting for a warning that
+    #    rarely appears before it even started waiting for the modal.
+    WARNING_CSS = "div.dijitTextBoxError"
+    CONFIRM_CSS = ".ReactModal__Content[aria-label='Confirm Address']"
+    handled_warning = False
+    end = time.time() + WAIT_LONG
+    while time.time() < end:
+        # (a) validation warning → second Save confirms the unmatched address
+        if not handled_warning:
+            try:
+                banners = [e for e in driver.find_elements(By.CSS_SELECTOR, WARNING_CSS) if e.is_displayed()]
+            except Exception:
+                banners = []
+            if any("could not find a match" in (b.text or "").lower() for b in banners):
+                print("[WARN] Address validation warning detected — clicking Save again to confirm.")
+                click_dijit_button_by_label(driver, "Save", timeout=WAIT_MED)
+                handled_warning = True
+                time.sleep(0.5)
+                continue
+        # (b) confirm-address modal
+        if _any_displayed(driver, By.CSS_SELECTOR, CONFIRM_CSS):
+            handle_address_confirmation_popup(driver, timeout=WAIT_MED)
+            break
+        # (c) form closed with no modal pending → done
+        if not _any_displayed(driver, By.CSS_SELECTOR, "input[name='address1']"):
+            print("[INFO] Address form closed (no confirmation popup needed).")
+            break
+        time.sleep(0.3)
+    else:
+        print("[WARN] Post-Save state still unresolved after wait — continuing.")
 
     return addr
 
 def fill_po_number_field(driver, po_number: str):
     po = coerce_str(po_number)
-    try:
-        inp = wait_visible(driver, By.ID, "dijit__WidgetsInTemplateMixin_4_poNumber_input", timeout=WAIT_LONG)
-    except TimeoutException:
-        inp = wait_visible(driver, By.XPATH, "//input[contains(@id,'poNumber') and @type='text']", timeout=WAIT_LONG)
-
+    # Displayed-aware: the fixed dijit id regenerates per render, and after the
+    # first order a stale hidden poNumber input can linger — first-match
+    # visibility waits then time out even though a fresh visible input exists.
+    inp = _find_displayed(driver, By.XPATH, "//input[contains(@id,'poNumber') and @type='text']",
+                          timeout=WAIT_LONG, context="(PO number field)")
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
     inp.clear()
     inp.send_keys(po)
@@ -1434,35 +1853,43 @@ def handle_order_confirmation_popup(driver, timeout=WAIT_LONG):
     """
     print("[INFO] Waiting for order confirmation popup...")
     try:
-        # Wait for the confirmation dialog to appear
-        confirmation_dialog = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".dijitDialog.modal-confirm"))
-        )
-        print("[INFO] Order confirmation popup detected")
-        
+        # Wait for a VISIBLE confirmation dialog.  Dojo keeps the previous
+        # order's dialog hidden in the DOM, so a presence check on the second
+        # order matched the stale order-1 dialog instantly, "clicked" its
+        # hidden Submit, then saw it "close" — while the real dialog for this
+        # order was never touched.
+        dialog = _find_displayed(driver, By.CSS_SELECTOR, ".dijitDialog.modal-confirm",
+                                 timeout=timeout, context="(order confirmation dialog)")
+        print("[INFO] Order confirmation popup detected (visible instance)")
+
         # Wait a moment for the dialog to fully render
         time.sleep(1)
-        
-        # Click the Submit button (id="dijit_form_Button_44" or search by label)
+
+        # Click the Submit button INSIDE this visible dialog — never by the
+        # auto-incrementing dijit_form_Button_NN id, which points at a
+        # different widget every render.
         try:
-            submit_btn = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.ID, "dijit_form_Button_44"))
+            submit_btn = dialog.find_element(
+                By.XPATH,
+                ".//span[contains(@class,'dijitButtonText') and normalize-space()='Submit']"
+                "/ancestor::*[@role='button'][1]"
             )
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
-            safe_click(driver, submit_btn)
-            print("[INFO] Clicked 'Submit' button in confirmation popup")
-        except TimeoutException:
-            # Fallback: click by button text
-            print("[INFO] Trying fallback method to find 'Submit' button...")
-            click_dijit_button_by_label(driver, "Submit", timeout=10)
-            print("[INFO] 'Submit' button clicked (fallback method)")
-        
-        # Wait for confirmation dialog to close
-        WebDriverWait(driver, timeout).until(
-            EC.invisibility_of_element_located((By.CSS_SELECTOR, ".dijitDialog.modal-confirm"))
-        )
-        print("[INFO] Order confirmation popup closed")
-        
+        except Exception:
+            submit_btn = dialog.find_element(
+                By.XPATH,
+                ".//span[contains(@class,'dijitButtonText') and normalize-space()='Submit']/.."
+            )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
+        safe_click(driver, submit_btn)
+        print("[INFO] Clicked 'Submit' button in confirmation popup")
+
+        # Wait until NO confirm dialog is visible any more (hidden stale copies
+        # in the DOM don't count).
+        if _wait_none_displayed(driver, By.CSS_SELECTOR, ".dijitDialog.modal-confirm", timeout=timeout):
+            print("[INFO] Order confirmation popup closed")
+        else:
+            print("[WARN] Order confirmation popup still visible after Submit click")
+
     except TimeoutException:
         print("[WARN] Order confirmation popup did not appear within timeout")
     except Exception as e:
@@ -1476,45 +1903,68 @@ def extract_order_id_from_success_popup(driver, timeout=WAIT_LONG):
     """
     print("[INFO] Waiting for order submission success popup...")
     try:
-        # Wait for the success dialog to appear
-        success_dialog = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".dijitDialog.submitOkModal"))
+        # Wait for a VISIBLE success dialog and read the order id from INSIDE
+        # that instance.  Presence-based lookups matched the hidden stale
+        # dialog from the previous order and could return order 1's ID for
+        # order 2 (or "succeed" before this order's dialog even opened).
+        success_dialog = _find_displayed(driver, By.CSS_SELECTOR, ".dijitDialog.submitOkModal",
+                                         timeout=timeout, context="(order success dialog)")
+        print("[INFO] Order submission success popup detected (visible instance)")
+
+        # Find the description paragraph containing the order ID — scoped to
+        # the visible dialog.
+        description = success_dialog.find_element(
+            By.CSS_SELECTOR, ".submitOkModalContents p[data-dojo-attach-point='description']"
         )
-        print("[INFO] Order submission success popup detected")
-        
-        # Find the description paragraph containing the order ID
-        description = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".submitOkModalContents p[data-dojo-attach-point='description']"))
-        )
-        
-        # Extract the text
-        success_text = description.text
+
+        # Extract the text (poll briefly — the text can render a beat later)
+        success_text = ""
+        end = time.time() + 10
+        while time.time() < end:
+            success_text = (description.text or "").strip()
+            if success_text:
+                break
+            time.sleep(0.3)
         print(f"[INFO] Success message: {success_text}")
-        
+
         # Extract order ID using regex (e.g., "Order 10744371 submitted successfully...")
         match = re.search(r"Order\s+(\d+)\s+submitted", success_text, re.IGNORECASE)
         if match:
             order_id = match.group(1)
             print(f"[SUCCESS] Extracted Order ID: {order_id}")
-            
-            # Click "Okay" to close the success dialog
+
+            # Click "Okay" INSIDE the visible dialog to close it
             try:
-                okay_btn = driver.find_element(By.XPATH, "//div[contains(@class,'submitOkModal')]//span[contains(@class,'dijitButtonText') and normalize-space()='Okay']/..")
+                okay_btn = success_dialog.find_element(
+                    By.XPATH,
+                    ".//span[contains(@class,'dijitButtonText') and normalize-space()='Okay']/.."
+                )
                 safe_click(driver, okay_btn)
                 print("[INFO] Clicked 'Okay' to close success popup")
             except Exception:
                 print("[WARN] Could not find 'Okay' button, popup may close automatically")
-            
+
+            # Let the dialog actually close before the caller moves on to the
+            # next order — starting the next import while it is still up was
+            # part of the second-order breakage.
+            if _wait_none_displayed(driver, By.CSS_SELECTOR, ".dijitDialog.submitOkModal", timeout=WAIT_MED):
+                print("[INFO] Success popup closed")
+            else:
+                print("[WARN] Success popup still visible — continuing anyway")
+
             return order_id
         else:
             print(f"[ERROR] Could not extract order ID from success message: {success_text}")
+            debug_dump(driver, "success_text_unparsed")
             return None
-            
+
     except TimeoutException:
         print("[ERROR] Order submission success popup did not appear within timeout")
+        debug_dump(driver, "no_success_popup")
         return None
     except Exception as e:
         print(f"[ERROR] Error extracting order ID from success popup: {e}")
+        debug_dump(driver, "success_popup_error")
         return None
 
 
@@ -1528,43 +1978,69 @@ def update_order_id_in_excel(excel_path: str, row_index: int, order_id: str):
         row_index: The pandas DataFrame index (row number)
         order_id: The order ID to add
     """
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            print(f"[INFO] Updating Excel file with Order ID: {order_id} (attempt {attempt})")
+
+            # Targeted openpyxl write: only touch the one column-M cell so the
+            # rest of the workbook (values, fonts, date formatting) is preserved.
+            # A full pandas read/to_excel round-trip would reset all formatting.
+            wb = load_workbook(excel_path)
+            ws = wb.active
+            cell = ws.cell(row=row_index + 2, column=13)  # +2: header row, 1-based
+
+            existing_value = coerce_str(cell.value)
+
+            # Append or set the order ID
+            if existing_value:
+                new_value = f"{existing_value} {order_id}"
+                print(f"[INFO] Appending to existing value: '{existing_value}' → '{new_value}'")
+            else:
+                new_value = order_id
+                print(f"[INFO] Setting new Order ID: '{new_value}'")
+
+            cell.value = new_value
+            wb.save(excel_path)
+            print(f"[SUCCESS] Excel file updated: {excel_path}")
+
+            return True
+
+        except Exception as e:
+            # Most common cause: the workbook is open in Excel (PermissionError
+            # on save).  Retry a couple of times, then record the ID in a
+            # fallback file so a placed order's ID is never lost.
+            last_err = e
+            print(f"[ERROR] Failed to update Excel file (attempt {attempt}): {e}")
+            time.sleep(2)
+
     try:
-        print(f"[INFO] Updating Excel file with Order ID: {order_id}")
-
-        # Targeted openpyxl write: only touch the one column-M cell so the
-        # rest of the workbook (values, fonts, date formatting) is preserved.
-        # A full pandas read/to_excel round-trip would reset all formatting.
-        wb = load_workbook(excel_path)
-        ws = wb.active
-        cell = ws.cell(row=row_index + 2, column=13)  # +2: header row, 1-based
-
-        existing_value = coerce_str(cell.value)
-
-        # Append or set the order ID
-        if existing_value:
-            new_value = f"{existing_value} {order_id}"
-            print(f"[INFO] Appending to existing value: '{existing_value}' → '{new_value}'")
-        else:
-            new_value = order_id
-            print(f"[INFO] Setting new Order ID: '{new_value}'")
-
-        cell.value = new_value
-        wb.save(excel_path)
-        print(f"[SUCCESS] Excel file updated: {excel_path}")
-
-        return True
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to update Excel file: {e}")
-        return False
+        fallback = os.path.join(SCRIPT_DIR, "order_ids_fallback.txt")
+        with open(fallback, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  row={row_index + 2}  order_id={order_id}\n")
+        print(f"[WARN] Excel locked/unwritable — Order ID saved to {fallback}")
+        print("[WARN] Close Processed_orders.xlsx in Excel and copy the ID into column M.")
+    except Exception as e2:
+        print(f"[ERROR] Could not write fallback order-id file either: {e2} (original error: {last_err})")
+    return False
 
 
 def main():
     options = webdriver.ChromeOptions()
+    if TSG_DEBUG:
+        options.add_argument(f"--remote-debugging-port={DEBUG_PORT}")
+        print(f"[DEBUG] TSG_DEBUG on — Chrome DevTools will listen on 127.0.0.1:{DEBUG_PORT}")
     driver = webdriver.Chrome(options=options)
 
     try:
-        login_and_land(driver)
+        try:
+            login_and_land(driver)
+        except Exception as e:
+            print(f"[ERROR] Login / landing failed: {e}")
+            traceback.print_exc()
+            debug_dump(driver, "login_failed")
+            debug_hold(driver, f"Login/landing failed: {e}")
+            raise
 
         df = pd.read_excel(EXCEL_PATH, engine="openpyxl", dtype=str)
 
@@ -1577,6 +2053,7 @@ def main():
         col_d = df.columns[3]   # Client PO number (used for file cleanup)
 
         skipped = []
+        failed = []
 
         for idx, row in df.iterrows():
             po_number   = coerce_str(row[col_g])
@@ -1591,6 +2068,20 @@ def main():
             # CRITICAL: Only process Ariat orders (skip Wrangler, Propper, etc.)
             if "ariat" not in vendor.lower():
                 print(f"[SKIP] Row {idx}: Not an Ariat order (Vendor: {vendor})")
+                continue
+
+            # CHECKPOINT: never place an order twice.  The ledger is
+            # vendor-aware (safe for split rows); the column-M check is kept
+            # as a backstop but only for single-vendor rows — on a split row
+            # column M may hold the OTHER vendor's ID.
+            prior = tsg_runlog.already_placed(SCRIPT_DIR, po_number, "ariat")
+            if prior:
+                print(f"[SKIP] Row {idx}: PO {po_number} already placed with Ariat on "
+                      f"{prior.get('when','?')} (Order ID: {prior.get('order_id') or 'n/a'}).")
+                continue
+            existing_id = coerce_str(row[df.columns[12]])
+            if existing_id and "/" not in vendor:
+                print(f"[SKIP] Row {idx}: already placed (Order ID '{existing_id}' in column M).")
                 continue
 
             m = re.search(r"\d+", order_field)
@@ -1608,44 +2099,98 @@ def main():
                 print(f"[SKIP] Order PO={po_number} (Client PO {client_po}) skipped — no address CSV.")
                 continue
 
-            upload_path = find_latest_matching_file(order_no)
-            print(f"[INFO] Using upload file: {upload_path}")
-
-            import_file_flow(driver, upload_path)
-            proceed_to_checkout_flow(driver)
-
-            addr = fill_drop_ship_address(driver, po_number, addr=addr)
-            print(f"[INFO] Address loaded from: {addr['csv_path']}")
-
-            fill_po_number_field(driver, po_number)
-
-            # Wait for user to review and press Enter
-            print("\n[ACTION REQUIRED]")
-            print("Review the cart / shipping / totals")
-            print("When ready, press Enter to automatically submit the order...")
-            wait_for_submit_enter()
-
-            # Automatically submit the order
             try:
-                click_place_order_button(driver, timeout=WAIT_LONG)
-                handle_order_confirmation_popup(driver, timeout=WAIT_LONG)
-                order_id = extract_order_id_from_success_popup(driver, timeout=WAIT_LONG)
-                
-                if order_id:
-                    # Update Excel with the order ID
-                    update_order_id_in_excel(EXCEL_PATH, idx, order_id)
-                    print(f"[SUCCESS] Order submitted successfully! Order ID: {order_id}")
-                else:
-                    print("[WARNING] Order may have been submitted, but Order ID could not be extracted.")
-                    print("Please check manually and update the Excel file if needed.")
-                    
+                # After an order completes, Ariat may land outside the Dojo
+                # order-builder (marketing/catalog page) or the shell may be
+                # mid re-render.  Ensure the builder is up before importing —
+                # starting the second order's import without this was a main
+                # source of the "crashes on the second order" failures.
+                if not _shell_is_ready(driver):
+                    print("[INFO] Order-builder shell not present — re-entering order builder...")
+                    enter_order_builder(driver, timeout=WAIT_LONG)
+                    wait_ready(driver)
+                    time.sleep(1.5)
+
+                # CART GUARD: never import on top of a leftover cart — this is
+                # what produced double-quantity orders after crashes/restarts.
+                ensure_fresh_ariat_order(driver)
+
+                upload_path = find_latest_matching_file(order_no)
+                print(f"[INFO] Using upload file: {upload_path}")
+                expected_units = expected_units_from_upload(upload_path)
+                print(f"[INFO] Upload file contains {expected_units} unit(s).")
+
+                import_file_flow(driver, upload_path)
+                verify_ariat_cart(driver, expected_units, "after import")
+                proceed_to_checkout_flow(driver)
+
+                addr = fill_drop_ship_address(driver, po_number, addr=addr)
+                print(f"[INFO] Address loaded from: {addr['csv_path']}")
+
+                fill_po_number_field(driver, po_number)
+
+                # Verify AGAIN on the checkout page before asking for review —
+                # the badge stays visible there, so a mismatch is caught even
+                # if something changed between import and checkout.
+                verify_ariat_cart(driver, expected_units, "pre-review")
+
+                # Wait for user to review and press Enter
+                print("\n[ACTION REQUIRED]")
+                print("Review the cart / shipping / totals")
+                print("When ready, press Enter to automatically submit the order...")
+                wait_for_submit_enter()
+
+                # Automatically submit the order
+                try:
+                    verify_ariat_cart(driver, expected_units, "final pre-submit")
+                    # A cancel-date modal can also (re)appear right before
+                    # submission — resolve it so Place Order isn't blocked.
+                    handle_availability_cancel_date_popup(driver, timeout=2)
+                    click_place_order_button(driver, timeout=WAIT_LONG)
+                    handle_order_confirmation_popup(driver, timeout=WAIT_LONG)
+                    order_id = extract_order_id_from_success_popup(driver, timeout=WAIT_LONG)
+
+                    if order_id:
+                        tsg_runlog.record_placed(SCRIPT_DIR, po_number, "ariat", order_id)
+                        # Update Excel with the order ID
+                        update_order_id_in_excel(EXCEL_PATH, idx, order_id)
+                        print(f"[SUCCESS] Order submitted successfully! Order ID: {order_id}")
+                    else:
+                        # Submission was attempted (Place Order + confirm both
+                        # clicked) — checkpoint it so a re-run can't double-place.
+                        # Marked UNCONFIRMED: verify on the vendor site, and if it
+                        # truly did not go through, delete this PO's entry from
+                        # placed_orders.json before re-running.
+                        tsg_runlog.record_placed(SCRIPT_DIR, po_number, "ariat", "UNCONFIRMED")
+                        print("[WARNING] Order may have been submitted, but Order ID could not be extracted.")
+                        print("[WARNING] Checkpointed as UNCONFIRMED — check the vendor site; if it was NOT")
+                        print("[WARNING] placed, remove this PO from placed_orders.json and re-run.")
+
+                except Exception as e:
+                    print(f"[ERROR] Error during order submission: {e}")
+                    print("You may need to complete the order manually.")
+                    input("Press Enter to continue to next order...")
+
             except Exception as e:
-                print(f"[ERROR] Error during order submission: {e}")
-                print("You may need to complete the order manually.")
-                input("Press Enter to continue to next order...")
+                # Per-order guard: capture the failing page, then (in debug
+                # mode) hold the browser open for live inspection instead of
+                # killing the whole run.
+                print(f"[ORDER_ERROR] PO={po_number}: {e}")
+                traceback.print_exc()
+                debug_dump(driver, f"order_{extract_po_key(po_number)}")
+                action = debug_hold(driver, f"Order PO={po_number} failed mid-flow: {e}")
+                if action != "continue":
+                    raise
+                failed.append((po_number, client_po))
+                continue
 
             print(f"=== ARIAT ORDER DONE: PO={po_number} ===")
 
+        if failed:
+            print("")
+            print(f"[INFO] {len(failed)} Ariat order(s) FAILED mid-flow (see debug dumps):")
+            for po, cpo in failed:
+                print(f"  - PO {po} (Client PO {cpo})")
         if skipped:
             print("")
             print(f"[INFO] {len(skipped)} Ariat order(s) skipped (missing address CSV):")

@@ -36,6 +36,8 @@ import traceback
 import pandas as pd
 from openpyxl import load_workbook
 
+import tsg_runlog
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
@@ -79,6 +81,13 @@ WAIT_SHORT = 10
 WAIT_LONG  = 25
 WAIT_XLONG = 45
 
+# Debug mode: set TSG_DEBUG=1 to (a) expose Chrome DevTools on port 9223 so an
+# external tool can attach and inspect the live page, (b) dump a screenshot +
+# HTML on any failure, and (c) HOLD the browser open on errors instead of
+# crashing out.
+TSG_DEBUG = os.getenv("TSG_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
+DEBUG_PORT = 9223
+
 # ── Propper region_id values (matches the <select name="region_id"> in checkout) ─
 STATE_TO_REGION_ID = {
     "AL": "1",   "AK": "2",   "AZ": "4",   "AR": "5",
@@ -104,6 +113,79 @@ STATE_TO_REGION_ID = {
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def debug_dump(driver, error_name="error"):
+    """Save a screenshot + page HTML + URL so a failure can be diagnosed later."""
+    try:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        png = os.path.join(SCRIPT_DIR, f"debug_propper_{error_name}_{ts}.png")
+        html = os.path.join(SCRIPT_DIR, f"debug_propper_{error_name}_{ts}.html")
+        driver.save_screenshot(png)
+        log(f"[DEBUG] Screenshot saved: {png}")
+        with open(html, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        log(f"[DEBUG] HTML saved: {html}")
+        log(f"[DEBUG] URL at failure: {driver.current_url}")
+    except Exception as e:
+        log(f"[DEBUG] Failed to save debug info: {e}")
+
+
+def debug_hold(driver, context=""):
+    """In TSG_DEBUG mode, keep the browser open and wait for instructions on stdin.
+
+    Returns 'continue' (move on to the next order) or 'abort' (end the run).
+    In normal mode returns 'abort' immediately (fail-fast, as before) —
+    continuing past a half-finished order risks a dirty cart contaminating the
+    next order, so that decision is only offered to a human in debug mode.
+    """
+    if not TSG_DEBUG:
+        return "abort"
+    log("")
+    log(f"[DEBUG_HOLD] {context}")
+    log(f"[DEBUG_HOLD] Browser held open (DevTools on 127.0.0.1:{DEBUG_PORT}).")
+    log("[DEBUG_HOLD] Type 'continue' to move to the next order, or 'abort' to end the run.")
+    while True:
+        try:
+            resp = input().strip().lower()
+        except EOFError:
+            return "abort"
+        if resp == "continue":
+            log("[DEBUG_HOLD] Continuing with the next order.")
+            return "continue"
+        if resp == "abort":
+            log("[DEBUG_HOLD] Aborting the run.")
+            return "abort"
+        if resp:
+            log(f"[DEBUG_HOLD] Unrecognized input '{resp}' — type 'continue' or 'abort'.")
+
+
+def _payment_step_active(driver) -> bool:
+    """True when the Magento checkout is already showing the PAYMENT step.
+
+    Magento resumes checkout server-side: if the cart already has a shipping
+    address (e.g. from a previously interrupted run), /checkout/ opens straight
+    on the payment step.  The old code assumed shipping always came first and
+    got stuck hunting for the New Address button on the payment page.
+    """
+    try:
+        url = driver.current_url or ""
+    except Exception:
+        url = ""
+    if "#payment" in url:
+        return True
+    try:
+        # The Purchase Order radio (or any payment-method input) is only
+        # rendered visible on the payment step.
+        for el in driver.find_elements(By.ID, "purchaseorder"):
+            if el.is_displayed():
+                return True
+        for el in driver.find_elements(By.CSS_SELECTOR, "li#payment, .checkout-payment-method"):
+            if el.is_displayed():
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def cleanup_po_files(client_po: str) -> None:
@@ -190,6 +272,172 @@ def wait_for_url_change(driver, original_url: str, timeout: int = WAIT_LONG) -> 
         if driver.current_url != original_url:
             return
         time.sleep(0.4)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CART VERIFICATION & SELF-HEALING (added 2026-08-31)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Magento keeps the cart server-side: a run that dies between Add-to-Cart and
+# checkout leaves its items in the cart, and the next run's upload stacks on
+# top — that is how double-quantity orders happened.  Every order now starts
+# from a verified-empty cart and must match the upload CSV exactly to proceed.
+
+def expected_items_from_csv(csv_path: str) -> dict:
+    """Parse the (re-saved) upload CSV into {SKU: qty}."""
+    out = {}
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            sku = (row.get("sku") or row.get("SKU") or "").strip().strip('"')
+            qty = (row.get("qty") or row.get("QTY") or "0").strip().strip('"')
+            if sku:
+                out[sku.upper()] = out.get(sku.upper(), 0) + (int(qty) if qty.isdigit() else 0)
+    return out
+
+
+def propper_cart_items(driver) -> dict:
+    """Read the live cart from /checkout/cart/ as {SKU: qty}.
+
+    Row layout (verified 2026-08-31): each item block shows 'SKU: <sku>' text
+    and a qty <input name='qty<itemId>'>.  An empty cart shows
+    'You have no items in your shopping cart.'
+    """
+    driver.get(CART_URL)
+    WebDriverWait(driver, WAIT_LONG).until(
+        lambda d: d.execute_script("return document.readyState") == "complete")
+    time.sleep(1.5)
+    data = driver.execute_script("""
+        var body = document.body.innerText || '';
+        if (/no items in your shopping cart/i.test(body)) return {empty: true, items: []};
+        var items = [];
+        [...document.querySelectorAll("input[name^='qty']")].forEach(function(inp){
+            if (!inp.offsetParent) return;
+            var row = inp.closest('tr') || inp.closest('div');
+            var hops = 0;
+            while (row && hops < 6 && !/SKU:/i.test(row.innerText || '')) {
+                row = row.parentElement; hops++;
+            }
+            var m = row ? (row.innerText || '').match(/SKU:\\s*([A-Za-z0-9_.-]+)/i) : null;
+            items.push({sku: m ? m[1] : '?', qty: parseInt(inp.value || '0', 10)});
+        });
+        return {empty: items.length === 0, items: items,
+                attention: /products? require your attention/i.test(body)};
+    """)
+    if data.get("attention"):
+        log("[CART_VERIFY] WARNING: site banner says products require attention!")
+    out = {}
+    for it in data.get("items", []):
+        out[str(it["sku"]).upper()] = out.get(str(it["sku"]).upper(), 0) + int(it["qty"] or 0)
+    return out
+
+
+def propper_clear_cart(driver, max_items: int = 25) -> None:
+    """Remove every line from the cart (per-row 'Remove' link, no confirm)."""
+    log("[CART_GUARD] Clearing the Propper cart...")
+    for _ in range(max_items):
+        removed = driver.execute_script("""
+            var r = [...document.querySelectorAll('a,button')].filter(function(e){
+                return e.offsetParent && (e.title === 'Remove' || /^Remove/.test((e.textContent||'').trim()));
+            })[0];
+            if (r) { r.click(); return true; }
+            return false;
+        """)
+        if not removed:
+            break
+        time.sleep(2.5)
+        WebDriverWait(driver, WAIT_LONG).until(
+            lambda d: d.execute_script("return document.readyState") == "complete")
+    if propper_cart_items(driver):
+        debug_dump(driver, "cart_clear_failed")
+        raise RuntimeError("Could not empty the Propper cart — refusing to continue.")
+    log("[CART_GUARD] Propper cart is now empty.")
+
+
+def ensure_fresh_propper_cart(driver) -> None:
+    """Guarantee an empty cart before uploading an order."""
+    items = propper_cart_items(driver)
+    if not items:
+        log("[INFO] Cart check: Propper cart is empty — OK to upload.")
+        return
+    log(f"[CART_GUARD] Propper cart has leftover items from a previous run: {items}")
+    debug_dump(driver, "leftover_cart_before_clear")
+    propper_clear_cart(driver)
+
+
+def verify_propper_cart(driver, expected: dict, context: str) -> None:
+    """Hard gate: cart contents must EXACTLY equal the upload CSV."""
+    actual = propper_cart_items(driver)
+    exp = {k.upper(): v for k, v in expected.items()}
+    if actual == exp:
+        log(f"[CART_VERIFY] OK ({context}): cart matches upload exactly: {actual}")
+        return
+    debug_dump(driver, f"cart_mismatch_{context.replace(' ', '_')}")
+    raise RuntimeError(
+        f"CART MISMATCH ({context}): cart contains {actual} but the upload file says {exp}. "
+        "NOT proceeding — a dirty cart would place a wrong-quantity order."
+    )
+
+
+def quickorder_rows_ok(driver) -> None:
+    """After the file is parsed on /quickorder/, fail fast if any row shows a
+    catalog error (e.g. 'The SKU was not found in the catalog.') BEFORE
+    clicking Add to Cart.  Verified live: bad rows keep their error text under
+    the item-number input."""
+    errs = driver.execute_script("""
+        return [...document.querySelectorAll('div,p,span')]
+          .filter(e => e.offsetParent && /not found in the catalog|require your attention/i.test(e.textContent||''))
+          .map(e => (e.textContent||'').trim().slice(0,120))
+          .filter((t, i, a) => a.indexOf(t) === i)
+          .slice(0, 6);
+    """)
+    if errs:
+        debug_dump(driver, "quickorder_row_errors")
+        raise RuntimeError(f"Quick Order rejected the upload file rows: {errs}")
+
+
+def verify_propper_checkout_summary(driver, expected: dict, context: str) -> None:
+    """Pre-submit gate that reads the checkout page's own order summary
+    (never navigates away mid-checkout).
+
+    Verified live 2026-08-31: the summary is Magento's items-in-cart block —
+    `.opc-block-summary .items-in-cart` with `.active` when EXPANDED and a
+    `.title[role=tab]` tab that toggles it.  Its rendered innerText has NO
+    colons/spaces after the labels ('SKUF52944X25044X36 Qty2' — the colons on
+    screen are CSS-injected), so labels are matched colon-optional."""
+    state = {}
+    for _ in range(4):
+        state = driver.execute_script("""
+            var blk = document.querySelector('.opc-block-summary .items-in-cart');
+            if (!blk) return {found: false, expanded: false, text: ''};
+            if (!/\\bactive\\b/.test(blk.className)) {
+                var t = blk.querySelector('.title');
+                if (t) t.click();
+                return {found: true, expanded: false, text: ''};
+            }
+            var c = blk.querySelector('.content') || blk;
+            return {found: true, expanded: true, text: (c.innerText || '')};
+        """) or {}
+        if state.get("expanded") and (state.get("text") or "").strip():
+            break
+        time.sleep(1.2)
+
+    text = state.get("text") or ""
+    if not state.get("found"):
+        # Summary block absent on this page — fall back to a whole-body scan.
+        text = driver.execute_script("return document.body.innerText") or ""
+
+    pairs = re.findall(r"SKU:?\s*([A-Za-z0-9_.-]+)[\s\S]{0,200}?Qty:?\s*(\d+)", text)
+    actual = {}
+    for sku, qty in pairs:
+        actual[str(sku).upper()] = actual.get(str(sku).upper(), 0) + int(qty)
+    exp = {k.upper(): v for k, v in expected.items()}
+    if actual == exp:
+        log(f"[CART_VERIFY] OK ({context}): checkout summary matches upload exactly: {actual}")
+        return
+    debug_dump(driver, f"summary_mismatch_{context.replace(' ', '_')}")
+    raise RuntimeError(
+        f"CHECKOUT SUMMARY MISMATCH ({context}): page shows {actual}, upload file says {exp}. "
+        "NOT submitting."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -427,6 +675,10 @@ def upload_and_add_to_cart(driver, csv_path: str) -> None:
     else:
         log("[WARN] Add to Cart button still appears disabled; attempting click anyway.")
 
+    # Fail fast if the parsed rows show catalog errors (bad SKU / quoting) —
+    # clicking Add to Cart in that state used to sail on with an empty cart.
+    quickorder_rows_ok(driver)
+
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", add_to_cart)
     safe_click(driver, add_to_cart)
     log("[INFO] Clicked Add to Cart.")
@@ -540,6 +792,11 @@ def fill_shipping_address(driver, addr: dict, client_po: str = "") -> None:
     """Click New Address, wait for the modal, fill all fields, click Ship Here."""
     wait = WebDriverWait(driver, WAIT_LONG)
 
+    # ── Skip entirely if checkout resumed on the payment step ────────────────
+    if _payment_step_active(driver):
+        log("[INFO] Checkout is already on the PAYMENT step — shipping is done; skipping address form.")
+        return
+
     # ── Click "New Address" ───────────────────────────────────────────────────
     log("[INFO] Looking for New Address button...")
     try:
@@ -556,6 +813,12 @@ def fill_shipping_address(driver, addr: dict, client_po: str = "") -> None:
         safe_click(driver, new_addr_btn)
         log("[INFO] Clicked New Address.")
     except TimeoutException:
+        # Re-check: the first payment-step probe can run while the checkout
+        # SPA is still booting.  If the New Address button never showed up and
+        # we are in fact on the payment step, shipping is already done.
+        if _payment_step_active(driver):
+            log("[INFO] New Address button absent because checkout is on the PAYMENT step — skipping address form.")
+            return
         log("[WARN] New Address button not found — form may already be visible.")
 
     # Small pause to let KO start animating the modal open
@@ -781,18 +1044,28 @@ def _do_fill_shipping_method(driver) -> None:
 def fill_shipping_method_and_next(driver) -> None:
     """Fill the shipping method and click Next, retrying if an error popup
     kicks us back to the shipping step."""
+    if _payment_step_active(driver):
+        log("[INFO] Checkout is already on the PAYMENT step — skipping shipping method.")
+        return
+
     for attempt in range(1, 5):
         log(f"[INFO] Shipping method fill — attempt {attempt}...")
         try:
             _do_fill_shipping_method(driver)
         except Exception as e:
+            if _payment_step_active(driver):
+                log("[INFO] Payment step appeared while waiting on shipping method — shipping already done.")
+                return
             log(f"[WARN] Could not fill shipping method (attempt {attempt}): {e}")
             if attempt < 4:
                 time.sleep(2)
                 continue
             else:
-                log("[ERROR] Giving up on shipping method after 4 attempts.")
-                return
+                debug_dump(driver, "shipping_method_giveup")
+                raise RuntimeError(
+                    "Could not fill the shipping method after 4 attempts "
+                    "(carrier dropdown / account field never became usable)."
+                ) from e
 
         # Click Next
         try:
@@ -808,8 +1081,11 @@ def fill_shipping_method_and_next(driver) -> None:
             safe_click(driver, next_btn)
             log("[INFO] Clicked Next.")
         except TimeoutException:
-            log("[WARN] Next button not found.")
-            return
+            if _payment_step_active(driver):
+                log("[INFO] Next button gone because we're already on the payment step.")
+                return
+            debug_dump(driver, "shipping_next_missing")
+            raise RuntimeError("Shipping-method Next button never became clickable.")
 
         # Wait a moment then check if we moved past the shipping step
         time.sleep(3)
@@ -828,7 +1104,11 @@ def fill_shipping_method_and_next(driver) -> None:
             log("[OK] Moved past shipping step.")
             return
 
-    log("[ERROR] Could not advance past the shipping method step after multiple attempts.")
+    debug_dump(driver, "shipping_step_stuck")
+    raise RuntimeError(
+        "Could not advance past the shipping method step after multiple attempts "
+        "(still on shipping after clicking Next — error popup kept kicking us back?)."
+    )
 
 
 def fill_payment(driver, po_number: str) -> None:
@@ -860,23 +1140,50 @@ def fill_payment(driver, po_number: str) -> None:
     log(f"[OK] PO number entered: '{po_text}'")
 
 
-def place_order(driver) -> str:
+def place_order(driver, po_number: str = "") -> str:
     """Click the Place Order button, wait for the confirmation page,
-    and return the order number (or empty string if not found)."""
+    and return the order number (or empty string if not found).
+
+    Retries once if Magento bounces with 'Purchase order number is a required
+    field' — observed live 2026-08-31: the Knockout-bound PO field can drop
+    its value if the checkout sits idle for a while before submission."""
     wait = WebDriverWait(driver, WAIT_LONG)
-    log("[INFO] Clicking Place Order...")
-    place_btn = wait.until(
-        EC.element_to_be_clickable(
-            (By.CSS_SELECTOR,
-             "button[data-role='review-save'][title='Place Order']")
+    for attempt in (1, 2):
+        log("[INFO] Clicking Place Order...")
+        place_btn = wait.until(
+            EC.element_to_be_clickable(
+                (By.CSS_SELECTOR,
+                 "button[data-role='review-save'][title='Place Order']")
+            )
         )
-    )
-    driver.execute_script(
-        "arguments[0].scrollIntoView({block:'center'});", place_btn
-    )
-    safe_click(driver, place_btn)
-    log("[OK] Place Order clicked — waiting for confirmation...")
-    time.sleep(5)
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", place_btn
+        )
+        safe_click(driver, place_btn)
+        log("[OK] Place Order clicked — waiting for confirmation...")
+        time.sleep(5)
+
+        po_required = driver.execute_script("""
+            return [...document.querySelectorAll("[class*='message'],[role='alert']")]
+                .some(function(e){ return e.offsetParent &&
+                    /purchase order number is a required field/i.test(e.textContent || ''); });
+        """)
+        if not po_required:
+            break
+        if attempt == 2 or not po_number:
+            debug_dump(driver, "po_required_error")
+            raise RuntimeError(
+                "Magento rejected submission: 'Purchase order number is a required field' "
+                "(PO field lost its value). Order NOT placed."
+            )
+        log("[WARN] PO field lost its value ('required field' error) — re-entering and retrying...")
+        po_input = wait.until(
+            EC.visibility_of_element_located(
+                (By.CSS_SELECTOR, "input#po_number, input[name='payment[po_number]']")
+            )
+        )
+        clear_and_type(driver, po_input, po_number.replace("-", " "))
+        time.sleep(1.0)
 
     # Extract order number from the confirmation page
     order_id = ""
@@ -890,38 +1197,55 @@ def place_order(driver) -> str:
         log(f"[OK] Propper order number: {order_id}")
     except TimeoutException:
         log("[WARN] Could not extract order number from confirmation page.")
+        debug_dump(driver, "no_confirmation_number")
     return order_id
 
 
 def update_order_id_in_excel(excel_path: str, row_index: int, order_id: str) -> bool:
     """Write the vendor order ID into column M (index 12) of the Excel file.
     If the cell already has a value, append with ', ' as separator."""
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            log(f"[INFO] Updating Excel with Order ID: {order_id} (attempt {attempt})")
+
+            # Targeted openpyxl write: only touch the one column-M cell so the
+            # rest of the workbook (values, fonts, date formatting) is preserved.
+            # A full pandas read/to_excel round-trip would reset all formatting.
+            wb = load_workbook(excel_path)
+            ws = wb.active
+            cell = ws.cell(row=row_index + 2, column=13)  # +2: header row, 1-based
+
+            existing = coerce_str(cell.value)
+
+            if existing:
+                new_val = f"{existing}, {order_id}"
+                log(f"[INFO] Appending: '{existing}' → '{new_val}'")
+            else:
+                new_val = order_id
+                log(f"[INFO] Setting Order ID: '{new_val}'")
+
+            cell.value = new_val
+            wb.save(excel_path)
+            log(f"[OK] Excel updated: {excel_path}")
+            return True
+        except Exception as e:
+            # Most common cause: the workbook is open in Excel (PermissionError
+            # on save).  Retry, then record the ID in a fallback file so a
+            # placed order's ID is never lost.
+            last_err = e
+            log(f"[ERROR] Failed to update Excel (attempt {attempt}): {e}")
+            time.sleep(2)
+
     try:
-        log(f"[INFO] Updating Excel with Order ID: {order_id}")
-
-        # Targeted openpyxl write: only touch the one column-M cell so the
-        # rest of the workbook (values, fonts, date formatting) is preserved.
-        # A full pandas read/to_excel round-trip would reset all formatting.
-        wb = load_workbook(excel_path)
-        ws = wb.active
-        cell = ws.cell(row=row_index + 2, column=13)  # +2: header row, 1-based
-
-        existing = coerce_str(cell.value)
-
-        if existing:
-            new_val = f"{existing}, {order_id}"
-            log(f"[INFO] Appending: '{existing}' → '{new_val}'")
-        else:
-            new_val = order_id
-            log(f"[INFO] Setting Order ID: '{new_val}'")
-
-        cell.value = new_val
-        wb.save(excel_path)
-        log(f"[OK] Excel updated: {excel_path}")
-        return True
-    except Exception as e:
-        log(f"[ERROR] Failed to update Excel: {e}")
-        return False
+        fallback = os.path.join(WORKSPACE_DIR, "order_ids_fallback.txt")
+        with open(fallback, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  row={row_index + 2}  order_id={order_id}\n")
+        log(f"[WARN] Excel locked/unwritable — Order ID saved to {fallback}")
+        log("[WARN] Close Processed_orders.xlsx in Excel and copy the ID into column M.")
+    except Exception as e2:
+        log(f"[ERROR] Could not write fallback order-id file either: {e2} (original error: {last_err})")
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1011,16 +1335,34 @@ def main():
     log("")
 
     # ── Browser automation ─────────────────────────────────────────────────────
-    driver = webdriver.Chrome()
+    options = webdriver.ChromeOptions()
+    if TSG_DEBUG:
+        options.add_argument(f"--remote-debugging-port={DEBUG_PORT}")
+        log(f"[DEBUG] TSG_DEBUG on — Chrome DevTools will listen on 127.0.0.1:{DEBUG_PORT}")
+    driver = webdriver.Chrome(options=options)
     try:
         # Login once for the session
-        login(driver)
+        try:
+            login(driver)
+        except Exception as e:
+            log(f"[ERROR] Propper login failed: {e}")
+            debug_dump(driver, "login_failed")
+            debug_hold(driver, f"Login failed: {e}")
+            raise
 
         total = len(order_data)
         skipped = []
         for order_num, (idx, row, order_no, csv_path) in enumerate(order_data, 1):
             po_number  = coerce_str(row[COL_G])
             client_po  = coerce_str(row[COL_D])
+
+            # CHECKPOINT: never place an order twice (vendor-aware, so split
+            # Propper/Wrangler rows are safe on re-runs after crashes).
+            prior = tsg_runlog.already_placed(SCRIPT_DIR, po_number, "propper")
+            if prior:
+                log(f"[SKIP] PO {po_number} already placed with Propper on {prior.get('when','?')} "
+                    f"(Order ID: {prior.get('order_id') or 'n/a'}).")
+                continue
 
             log("")
             log("─" * 60)
@@ -1042,20 +1384,44 @@ def main():
             log(f"[INFO] Ship to: {addr.get('company','?')} | "
                 f"{addr.get('city','?')}, {addr.get('state','?')} {addr.get('zip','?')}")
 
-            # ── Step 1: Upload CSV + Add to Cart ──────────────────────────────
-            upload_and_add_to_cart(driver, csv_path)
+            try:
+                # ── Step 0: CART GUARD — start from a verified-empty cart ─────
+                # (Leftover items from a crashed run are what doubled orders.)
+                ensure_fresh_propper_cart(driver)
+                expected_items = expected_items_from_csv(csv_path)
+                log(f"[INFO] Upload file expects: {expected_items}")
 
-            # ── Step 2: Proceed to Checkout ───────────────────────────────────
-            proceed_to_checkout(driver)
+                # ── Step 1: Upload CSV + Add to Cart ──────────────────────────
+                upload_and_add_to_cart(driver, csv_path)
 
-            # ── Step 3: Fill shipping address ─────────────────────────────────
-            fill_shipping_address(driver, addr, client_po=client_po)
+                # ── Step 1b: Verify the cart matches the upload exactly ───────
+                verify_propper_cart(driver, expected_items, "after upload")
 
-            # ── Step 4: Select FedEx Ground + account number + Next ───────────
-            fill_shipping_method_and_next(driver)
+                # ── Step 2: Proceed to Checkout ───────────────────────────────
+                proceed_to_checkout(driver)
 
-            # ── Step 5: Fill payment (Purchase Order) ─────────────────────────
-            fill_payment(driver, po_number)
+                # ── Step 3: Fill shipping address ─────────────────────────────
+                # (Skips itself automatically if Magento resumed the checkout
+                #  on the payment step — shipping already done for this cart.)
+                fill_shipping_address(driver, addr, client_po=client_po)
+
+                # ── Step 4: Select FedEx Ground + account number + Next ───────
+                fill_shipping_method_and_next(driver)
+
+                # ── Step 5: Fill payment (Purchase Order) ─────────────────────
+                fill_payment(driver, po_number)
+
+                # ── Step 5b: Final quantity gate on the checkout summary ──────
+                verify_propper_checkout_summary(driver, expected_items, "pre-review")
+            except Exception as e:
+                log(f"[ORDER_ERROR] PO={po_number} (Client PO {client_po}): {e}")
+                traceback.print_exc()
+                debug_dump(driver, f"order_{client_po}")
+                action = debug_hold(driver, f"Order PO={po_number} failed mid-flow: {e}")
+                if action != "continue":
+                    raise
+                skipped.append((po_number, client_po))
+                continue
 
             # ── Step 6: PAUSE for user review ─────────────────────────────────
             log("")
@@ -1074,8 +1440,9 @@ def main():
             log("[INFO] User confirmed — placing order...")
 
             # ── Step 7: Place Order ───────────────────────────────────────────
-            order_id = place_order(driver)
+            order_id = place_order(driver, po_number=po_number)
             log(f"[OK] Order placed for PO '{po_number}'!")
+            tsg_runlog.record_placed(SCRIPT_DIR, po_number, "propper", order_id or "UNCONFIRMED")
 
             if order_id:
                 update_order_id_in_excel(EXCEL_PATH, idx, order_id)

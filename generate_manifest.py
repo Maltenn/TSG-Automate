@@ -37,7 +37,7 @@ from datetime import date
 
 # Base URL where files are publicly reachable (no trailing slash).
 # GitHub example:
-BASE_URL = "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main"
+BASE_URL = "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main"
 
 # All files the updater should manage (paths relative to this script's folder).
 FILE_NAMES = [
@@ -52,6 +52,13 @@ FILE_NAMES = [
     "PMtoARIAT.py",
     "PMtoPropper.py",
     "GetOrderId.py",
+    # REQUIRED since 2026-08-31: the vendor scripts and GetOrderId all
+    # `import tsg_runlog` (the placement-ledger checkpoint module).  Without
+    # this file an update would break every machine with an ImportError.
+    "tsg_runlog.py",
+    # Optional live-debugging helper (nothing imports it; used manually with
+    # TSG_DEBUG=1 runs).  Needs `requests` + `websocket-client` if actually run.
+    "debug_inspect.py",
     # Add more files here as needed:
     # "SomeNewScript.py",
 ]
