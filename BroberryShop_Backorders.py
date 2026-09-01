@@ -771,6 +771,33 @@ def fix_missing_restock_date(shop_driver, sku, waist, inseam):
     return False
 
 
+def _shop_line_now_orderable(shop_driver, sku, waist, inseam):
+    """Refresh the shop product page and report whether (waist, inseam) now
+    shows a usable qty input.
+
+    Called right after a successful admin restock fix so the unlock is
+    verified — and visible — in the order window itself before the admin
+    window is closed.
+    """
+    try:
+        shop_driver.get(PRODUCT_MAP[sku]["url"])
+        time.sleep(0.5)
+        located = _locate_qty_input_and_context(shop_driver, sku, waist, inseam)
+    except UnorderableSizeError:
+        return False
+    except Exception:
+        return False
+    if not located:
+        return False
+    qty_input, _ = located
+    try:
+        if qty_input.get_attribute("disabled") or qty_input.get_attribute("readonly"):
+            return False
+    except Exception:
+        return False
+    return True
+
+
 # ─── RESTOCK DATE LOOKUP (for --prefer-sooner mode) ───────────────────────────
 _RESTOCK_DATE_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b")
 
@@ -1411,16 +1438,27 @@ def process_backorder_csv(driver, csv_path, account_email=None):
 
         if status == 'greyed_out':
             # Sold out with no restock date → no qty input at all.  The
-            # customer already approved this back order, so set the 99/99/9999
-            # placeholder restock date in the admin panel and retry the add
-            # instead of skipping the line.
+            # customer already approved this back order, so set the placeholder
+            # restock date in the admin panel and retry the add instead of
+            # skipping the line.
             print(f"🛠  {reason} — setting placeholder restock date via the admin panel…")
             if fix_missing_restock_date(driver, sku, waist, inseam):
                 time.sleep(1.0)   # let the shop pick up the change
-                status, reason = try_add_line(driver, sku, waist, inseam, qty)
-                if status == 'greyed_out':
-                    status, reason = 'unavailable', (
-                        f"still greyed out after restock-date fix ({reason})")
+                # Refresh the order window so the unlock is verified (and
+                # visible) there, and only then close the admin window — left
+                # open it sits on top of the order window and makes the run
+                # look stuck.  On failure it stays open for inspection.
+                size_str = f"{waist}{('x'+str(inseam)) if inseam is not None else ''}"
+                if _shop_line_now_orderable(driver, sku, waist, inseam):
+                    print(f"   ✓ {sku} {size_str} shows orderable after refresh — "
+                          "closing the admin window.")
+                    shutdown_restock_admin_driver()
+                    status, reason = try_add_line(driver, sku, waist, inseam, qty)
+                    if status == 'greyed_out':
+                        status, reason = 'unavailable', (
+                            f"greyed out again on add ({reason})")
+                else:
+                    status, reason = 'unavailable', 'still greyed out after restock-date fix'
             else:
                 status, reason = 'unavailable', 'restock-date fix failed'
 
