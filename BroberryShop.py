@@ -485,6 +485,34 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
         return None
 
 
+def _cell_shows_sold_out(driver, context):
+    """True when the located size cell/row carries the slate 'sold out' price
+    pill (bg-slate-100 text-slate-500).
+
+    Pill colors on the size grid: green/amber = in stock, red = back-ordered
+    WITH a restock date, slate = sold out with NO restock date.  Slate cells
+    normally have no qty input at all, but the shop sometimes renders one
+    anyway — ordering those goes through silently even though nothing can
+    ship, so they must be treated as out of stock.  Checked via JS because
+    find_elements would eat the driver's 5s implicit wait on every in-stock
+    line.
+    """
+    try:
+        return bool(driver.execute_script(
+            """
+            const ctx = arguments[0];
+            for (const s of ctx.querySelectorAll('span')) {
+                const cls = s.className || '';
+                if (cls.includes('bg-slate-100') && cls.includes('text-slate-500')
+                        && (s.innerText || '').includes('$')) return true;
+            }
+            return false;
+            """,
+            context))
+    except Exception:
+        return False
+
+
 def try_add_line(driver, sku, waist, inseam, qty):
     driver.get(PRODUCT_MAP[sku]["url"])
     time.sleep(0.5)
@@ -500,6 +528,9 @@ def try_add_line(driver, sku, waist, inseam, qty):
 
     if qty_input.get_attribute("disabled") or qty_input.get_attribute("readonly"):
         return ('unavailable', 'qty input disabled')
+
+    if _cell_shows_sold_out(driver, context):
+        return ('unavailable', 'sold out with no restock date (greyed price)')
 
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", qty_input)
     # JS focus instead of .click(): each cell now has a hover-triggered price tooltip
@@ -844,6 +875,9 @@ def process_csv(driver, csv_path, account_email=None):
         status, reason = try_add_line(driver, sku, waist, inseam, qty)
         if status == 'fatal_unorderable_size':
             print(f"⛔ Skipping order {po_number}: {reason}")
+            # Log it like every other stock-based skip so the back-orders
+            # pipeline (BroberryShop_Backorders.py) can pick the PO up.
+            log_skipped_order(po_number, f"Order skipped due to back order ({reason})")
             clear_cart(driver)
             return
         if status == 'unavailable':

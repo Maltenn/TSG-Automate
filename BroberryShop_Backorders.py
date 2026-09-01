@@ -348,15 +348,24 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
         inputs = cell.find_elements(By.CSS_SELECTOR, "input[type='number']")
         if inputs:
             return inputs[0], cell
-        raise UnorderableSizeError(
+        err = UnorderableSizeError(
             f"{sku} size {waist_i}{('x'+str(inseam_i)) if inseam_i is not None else ''} is not orderable (no qty input)"
         )
+        err.cell = cell   # the greyed cell — restock fix reads its hidden ids
+        raise err
 
     def try_row():
         row = driver.find_element(By.XPATH, f"//tr[.//*[self::td or self::th][normalize-space()='{waist_i}']]")
         qty_inputs = row.find_elements(By.CSS_SELECTOR, "input[type='number']")
         if not qty_inputs:
-            raise UnorderableSizeError(f"{sku} size {waist_i} is not orderable (no qty input)")
+            # Only trust "row exists but no qty input" when it's a real product
+            # row — header rows of grid tables also contain the bare size text
+            # but never carry a $ price pill.
+            if not row.find_elements(By.XPATH, ".//span[contains(normalize-space(), '$')]"):
+                return None
+            err = UnorderableSizeError(f"{sku} size {waist_i} is not orderable (no qty input)")
+            err.cell = row
+            raise err
         return qty_inputs[0], row
 
     def try_length_grid():
@@ -396,18 +405,27 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
         inputs = cell.find_elements(By.CSS_SELECTOR, "input[type='number']")
         if inputs:
             return inputs[0], cell
-        raise UnorderableSizeError(
+        err = UnorderableSizeError(
             f"{sku} size {waist_i} {length_label} is not orderable (no qty input)"
         )
+        err.cell = cell
+        raise err
 
+    # UnorderableSizeError must propagate out of EVERY mode here (the main
+    # BroberryShop.py swallows it for grid/auto): a greyed-out cell is the
+    # trigger for the admin restock-date fix on a back-order run.
     if mode == "grid":
         try:
             return try_grid()
+        except UnorderableSizeError:
+            raise
         except Exception:
             return None
     if mode == "row":
         try:
             return try_row()
+        except UnorderableSizeError:
+            raise
         except Exception:
             return None
     if mode == "length_grid":
@@ -423,11 +441,15 @@ def _locate_qty_input_and_context(driver, sku, waist, inseam):
         res = try_grid()
         if res:
             return res
+    except UnorderableSizeError:
+        raise
     except Exception:
         pass
 
     try:
         return try_row()
+    except UnorderableSizeError:
+        raise
     except Exception:
         return None
 
@@ -439,7 +461,10 @@ def try_add_line(driver, sku, waist, inseam, qty):
     try:
         located = _locate_qty_input_and_context(driver, sku, waist, inseam)
     except UnorderableSizeError as e:
-        return ('fatal_unorderable_size', str(e))
+        # Sold out with NO restock date: the shop renders the size cell as a
+        # bare greyed price pill with no qty input.  The caller repairs this
+        # through the admin panel (fix_missing_restock_date) and retries.
+        return ('greyed_out', str(e))
     if not located:
         return ('unavailable', 'size not found on page')
 
@@ -478,6 +503,274 @@ def try_add_line(driver, sku, waist, inseam, qty):
     return ('added', None)
 
 
+# ─── GREYED-OUT SIZE FIX (admin restock-date placeholder) ─────────────────────
+# A size that is sold out AND has no Restock At date renders as a bare greyed
+# price pill with no qty input, so it cannot be ordered even as a back-order.
+# This script only runs after the customer has approved the back order, so
+# instead of skipping the line we repair the product in the admin panel: open
+# its edit page, set the line's Restock At field to a far-future placeholder,
+# save, and retry the add — the shop then renders the size as an orderable
+# back-order line.  Mechanics mirror DeleteLineItems.py (edit page → find the
+# product_items row → act on it → one Update save).
+#
+# The placeholder is 12/31/9999, NOT the office convention 99/99/9999:
+# restock_at is a DATE column and the admin backend runs the submitted text
+# through a date parser — an unparseable 99/99/9999 is silently stored as
+# 01/01/1970 (verified live 2026-09-01).  12/31/9999 is the largest date the
+# column can hold and reads just as clearly as "no real date yet".
+RESTOCK_PLACEHOLDER_DATE = "12/31/9999"
+PRODUCT_EDIT_URL_TMPL    = "https://admin.broberry.com/products/edit/{product_id}"
+
+_restock_admin_driver = None   # one admin session, reused for every fix this run
+
+
+def _get_restock_admin_driver():
+    """Boot (once) and return the admin-panel driver used for restock fixes."""
+    global _restock_admin_driver
+    if _restock_admin_driver is not None:
+        try:
+            _ = _restock_admin_driver.current_url   # liveness check
+            return _restock_admin_driver
+        except Exception:
+            try:
+                _restock_admin_driver.quit()
+            except Exception:
+                pass
+            _restock_admin_driver = None
+    driver = _setup_admin_driver()
+    _admin_login(driver)
+    _restock_admin_driver = driver
+    return driver
+
+
+def shutdown_restock_admin_driver():
+    """Close the restock-fix admin session (safe to call when never booted)."""
+    global _restock_admin_driver
+    if _restock_admin_driver is not None:
+        try:
+            _restock_admin_driver.quit()
+        except Exception:
+            pass
+        _restock_admin_driver = None
+
+
+def _harvest_cell_identity(shop_driver, sku, waist, inseam):
+    """On the CURRENT shop product page, pull the admin identifiers needed to
+    fix a greyed-out size: the product_item id (exact row match) and the
+    product id (admin edit-page URL).
+
+    Greyed cells carry NO hidden inputs at all, so the item id is usually
+    unavailable — but every orderable cell of the page shares the same
+    [product_id] hidden input, which is all we need to open the edit page.
+
+    Returns (item_id or None, product_id or None).
+    """
+    item_id = product_id = None
+    cell = None
+    try:
+        _locate_qty_input_and_context(shop_driver, sku, waist, inseam)
+    except UnorderableSizeError as e:
+        cell = getattr(e, "cell", None)
+    except Exception:
+        pass
+
+    if cell is not None:
+        try:
+            for h in cell.find_elements(By.CSS_SELECTOR, "input[type='hidden']"):
+                name = h.get_attribute("name") or ""
+                if name.endswith("[product_id]") and not product_id:
+                    product_id = (h.get_attribute("value") or "").strip() or None
+                elif name.endswith("[id]") and not item_id:
+                    item_id = (h.get_attribute("value") or "").strip() or None
+        except Exception:
+            pass
+
+    if not product_id:
+        try:
+            for h in shop_driver.find_elements(
+                    By.CSS_SELECTOR, "input[type='hidden'][name$='[product_id]']"):
+                val = (h.get_attribute("value") or "").strip()
+                if val:
+                    product_id = val
+                    break
+        except Exception:
+            pass
+
+    return item_id, product_id
+
+
+def _find_admin_item_row(admin_driver, item_id, waist, inseam):
+    """Locate the product_items <tr> on the admin edit page.
+
+    Prefer the exact product_item id (hidden [id] input value); fall back to
+    matching the row's [size]/[width] fields against the ordered waist/inseam
+    (admin size == shop waist, admin width == shop inseam; width is empty for
+    single-dimension products).  Returns the row element, or None — never
+    guesses when the match is ambiguous.
+    """
+    if item_id:
+        for el in admin_driver.find_elements(
+                By.CSS_SELECTOR, f"input[name$='[id]'][value='{item_id}']"):
+            try:
+                return el.find_element(By.XPATH, "./ancestor::tr[1]")
+            except Exception:
+                continue
+        print(f"   ⚠️  Restock fix: no admin row with item id {item_id} — trying size match.")
+
+    waist_s  = "" if waist  is None else str(waist).strip()
+    inseam_s = "" if inseam is None else str(inseam).strip()
+    matches = []
+    for size_in in admin_driver.find_elements(By.CSS_SELECTOR, "input[name$='[size]']"):
+        try:
+            if (size_in.get_attribute("value") or "").strip() != waist_s:
+                continue
+            row = size_in.find_element(By.XPATH, "./ancestor::tr[1]")
+            width_val = ""
+            width_els = row.find_elements(By.CSS_SELECTOR, "input[name$='[width]']")
+            if width_els:
+                width_val = (width_els[0].get_attribute("value") or "").strip()
+            if width_val.lower() == inseam_s.lower():
+                matches.append(row)
+        except StaleElementReferenceException:
+            continue
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(f"   ⚠️  Restock fix: {len(matches)} admin rows match "
+              f"size {waist_s}/{inseam_s} — refusing to guess.")
+    return None
+
+
+def _read_admin_item_fields(admin_driver, item_id, waist, inseam,
+                            fields=("restock_at", "stock")):
+    """Re-find the row and return {field: current value} for the given
+    product_items input suffixes, or None when the row can't be found."""
+    row = _find_admin_item_row(admin_driver, item_id, waist, inseam)
+    if row is None:
+        return None
+    out = {}
+    for f in fields:
+        els = row.find_elements(By.CSS_SELECTOR, f"input[name$='[{f}]']")
+        out[f] = (els[0].get_attribute("value") or "").strip() if els else None
+    return out
+
+
+def fix_missing_restock_date(shop_driver, sku, waist, inseam):
+    """Set RESTOCK_PLACEHOLDER_DATE on the admin product line for (sku, waist,
+    inseam) so the greyed-out size becomes orderable as a back-order.
+
+    Expects the shop driver to still be on the product page (try_add_line has
+    just navigated there).  Returns True only when the saved value was
+    re-read from a fresh admin page load and matches the placeholder.
+    """
+    size_str = f"{waist}{('x' + str(inseam)) if inseam is not None else ''}"
+    item_id, product_id = _harvest_cell_identity(shop_driver, sku, waist, inseam)
+    if not product_id:
+        print(f"   ✖ Restock fix: no [product_id] hidden input on the {sku} page — "
+              "cannot open the admin edit page.")
+        return False
+    print(f"   🛠  Restock fix: {sku} {size_str} → admin product {product_id}"
+          + (f", item {item_id}" if item_id else f", matching row by size {size_str}"))
+
+    try:
+        admin = _get_restock_admin_driver()
+    except Exception as e:
+        print(f"   ✖ Restock fix: admin login failed: {e}")
+        return False
+
+    edit_url = PRODUCT_EDIT_URL_TMPL.format(product_id=product_id)
+    try:
+        admin.get(edit_url)
+        WebDriverWait(admin, 15).until(EC.presence_of_element_located(
+            (By.XPATH, "//input[contains(@name, '[restock_at]')]")))
+        time.sleep(0.3)
+    except TimeoutException:
+        print(f"   ✖ Restock fix: no line-item table on admin edit page for "
+              f"product {product_id}.")
+        return False
+
+    row = _find_admin_item_row(admin, item_id, waist, inseam)
+    if row is None:
+        print(f"   ✖ Restock fix: could not find the {sku} {size_str} line on the "
+              "admin edit page.")
+        return False
+
+    # The shop only renders a qty input when stock >= 0: 0 + restock date is a
+    # proper red back-order cell, but a NEGATIVE count (oversell artifact)
+    # keeps the cell locked no matter what the restock date says — verified
+    # live 2026-09-01.  Normalise negative stock to 0 alongside the date.
+    stock_note = ""
+    try:
+        stock_in = row.find_element(By.CSS_SELECTOR, "input[name$='[stock]']")
+        raw_stock = (stock_in.get_attribute("value") or "").strip()
+        try:
+            stock_val = int(float(raw_stock)) if raw_stock else None
+        except ValueError:
+            stock_val = None
+        if stock_val is not None and stock_val < 0:
+            admin.execute_script(
+                "arguments[0].scrollIntoView({block:'center', inline:'center'});", stock_in)
+            stock_in.clear()
+            stock_in.send_keys("0")
+            stock_note = f", stock {stock_val} → 0"
+    except Exception as e:
+        print(f"   ⚠️  Restock fix: could not read/adjust the stock field: {e}")
+
+    try:
+        restock_in = row.find_element(By.CSS_SELECTOR, "input[name$='[restock_at]']")
+        admin.execute_script(
+            "arguments[0].scrollIntoView({block:'center', inline:'center'});", restock_in)
+        restock_in.clear()
+        restock_in.send_keys(RESTOCK_PLACEHOLDER_DATE)
+    except Exception as e:
+        print(f"   ✖ Restock fix: could not fill the Restock At field: {e}")
+        return False
+
+    try:
+        update_btn = WebDriverWait(admin, 12).until(EC.element_to_be_clickable(
+            (By.XPATH, "//button[@type='submit' and normalize-space()='Update']")))
+        admin.execute_script("arguments[0].scrollIntoView({block:'center'});", update_btn)
+        time.sleep(0.1)
+        admin.execute_script("arguments[0].click();", update_btn)
+    except Exception as e:
+        print(f"   ✖ Restock fix: could not click Update: {e}")
+        return False
+
+    # The form posts and the page navigates/re-renders; wait for that, then
+    # reload the edit page fresh and verify the value actually persisted.
+    try:
+        WebDriverWait(admin, 10).until(EC.staleness_of(restock_in))
+    except TimeoutException:
+        time.sleep(2)   # in-place save — give the POST a moment anyway
+    try:
+        admin.get(edit_url)
+        WebDriverWait(admin, 15).until(EC.presence_of_element_located(
+            (By.XPATH, "//input[contains(@name, '[restock_at]')]")))
+        time.sleep(0.3)
+        vals = _read_admin_item_fields(admin, item_id, waist, inseam)
+    except Exception as e:
+        print(f"   ⚠️  Restock fix: could not verify the save ({e}) — treating as failed.")
+        return False
+
+    saved = (vals or {}).get("restock_at") or ""
+    saved_stock = (vals or {}).get("stock") or ""
+    try:
+        stock_ok = int(float(saved_stock)) >= 0
+    except (ValueError, TypeError):
+        stock_ok = False
+
+    # The backend may re-render the stored date in another format; the year
+    # 9999 is proof enough that the placeholder (and not 01/01/1970 from a
+    # failed parse, or the old value) is what persisted.
+    if "9999" in saved and stock_ok:
+        print(f"   ✓ Restock fix saved: {sku} {size_str} restock date = {saved}"
+              f"{stock_note} (stock now {saved_stock})")
+        return True
+    print(f"   ⚠️  Restock fix: saved restock={saved!r} stock={saved_stock!r} — "
+          "treating as failed.")
+    return False
+
+
 # ─── RESTOCK DATE LOOKUP (for --prefer-sooner mode) ───────────────────────────
 _RESTOCK_DATE_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b")
 
@@ -500,8 +793,8 @@ def read_restock_info(driver, sku, waist, inseam):
     These two flags must be kept distinct: an earlier version returned
     only the date, so "in-stock" and "unorderable at this size" both
     collapsed to None — which caused pick_best_sku to swap to an
-    unorderable sub and abort the whole order via try_add_line's fatal
-    path.  Callers MUST check ``orderable`` before acting on the date.
+    unorderable sub.  Callers MUST check ``orderable`` before acting on
+    the date.
 
     Never raises on failure — a failed lookup must not abort the order.
     """
@@ -583,8 +876,8 @@ def pick_best_sku(driver, sku, waist, inseam):
     sooner/in-stock availability for this specific (waist, inseam).
 
     Orderability gates the decision — a swap to an UNORDERABLE sub would
-    cause try_add_line to return 'fatal_unorderable_size', which aborts
-    the entire order via clear_cart.  So if the sub cannot accept this
+    at best trigger a needless admin restock-date fix on the sub (greyed
+    cell) and at worst skip the line.  So if the sub cannot accept this
     size (size missing from its grid, cell has no qty input, or input
     disabled), we never swap to it regardless of dates.
 
@@ -1116,10 +1409,21 @@ def process_backorder_csv(driver, csv_path, account_email=None):
 
         status, reason = try_add_line(driver, sku, waist, inseam, qty)
 
-        if status == 'fatal_unorderable_size':
-            print(f"⛔ Fatal: {reason} — aborting order {po_number}.")
-            clear_cart(driver)
-            return
+        if status == 'greyed_out':
+            # Sold out with no restock date → no qty input at all.  The
+            # customer already approved this back order, so set the 99/99/9999
+            # placeholder restock date in the admin panel and retry the add
+            # instead of skipping the line.
+            print(f"🛠  {reason} — setting placeholder restock date via the admin panel…")
+            if fix_missing_restock_date(driver, sku, waist, inseam):
+                time.sleep(1.0)   # let the shop pick up the change
+                status, reason = try_add_line(driver, sku, waist, inseam, qty)
+                if status == 'greyed_out':
+                    status, reason = 'unavailable', (
+                        f"still greyed out after restock-date fix ({reason})")
+            else:
+                status, reason = 'unavailable', 'restock-date fix failed'
+
         if status == 'unavailable':
             # On a back-order run we still skip lines that are completely
             # unavailable (no qty input / not found on page) since those
@@ -1608,6 +1912,7 @@ def main():
         if driver:
             try: driver.quit()
             except Exception: pass
+        shutdown_restock_admin_driver()
 
     # ── Phase 2: PM logging for every order we just placed ────────────────
     if successfully_placed:
