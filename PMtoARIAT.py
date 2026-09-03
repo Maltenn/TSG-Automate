@@ -1754,21 +1754,54 @@ def fill_drop_ship_address(driver, po_number: str, addr: dict = None):
     state_ab = addr["state_abbr"]
     state_name = US_STATE_ABBR_TO_NAME.get(state_ab, "")
     if state_name:
-        # Displayed-aware: the previous order's drop-ship modal (state dropdown
-        # AND its popup menu items) lingers hidden in the DOM, so first-match
-        # waits bound to the stale copy and timed out.  Confirmed live on
-        # 2026-08-28: order 2's visible dropdown said 'select...' while a
-        # hidden 'Louisiana' copy from order 1 soaked up every click attempt.
+        # Set the state through Dojo's OWN widget API (dijit.form.Select
+        # .set('value', 'KY')) — clicking the dropdown open is unreliable:
+        # the popup can fail to open or instantly toggle closed, leaving the
+        # widget on 'select...' while the item wait burns 90s (caught live
+        # 2026-09-03 on Kentucky).  Displayed-aware lookup still matters:
+        # hidden stale copies of the dropdown linger from previous orders.
         st = _find_displayed(driver, By.CSS_SELECTOR, "span.dijitSelect.state",
                              timeout=WAIT_LONG, context="(state dropdown)")
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", st)
-        safe_click(driver, st)
+        set_ok = driver.execute_script("""
+            var node = arguments[0], val = arguments[1];
+            if (!window.dijit || !dijit.registry) return false;
+            var w = dijit.registry.getEnclosingWidget(node);
+            if (!w || !w.set) return false;
+            w.set('value', val);
+            return !!(w.get && String(w.get('value')) === val);
+        """, st, state_ab)
+        if set_ok:
+            print(f"[INFO] State set via widget API: {state_ab} ({state_name})")
+        else:
+            # Fallback: the historical open-dropdown-and-click-item path
+            print("[WARN] Widget API could not set the state — falling back to dropdown clicks.")
+            safe_click(driver, st)
+            item = _find_displayed(
+                driver, By.XPATH,
+                f"//td[contains(@class,'dijitMenuItemLabel') and normalize-space()='{state_name}']",
+                timeout=WAIT_MED, context=f"(state menu item '{state_name}')")
+            safe_click(driver, item)
 
-        item = _find_displayed(
-            driver, By.XPATH,
-            f"//td[contains(@class,'dijitMenuItemLabel') and normalize-space()='{state_name}']",
-            timeout=WAIT_LONG, context=f"(state menu item '{state_name}')")
-        safe_click(driver, item)
+        # Verify the visible widget actually shows the chosen state before
+        # moving on — never proceed to Save with 'select...' still showing.
+        end = time.time() + 10
+        shown = ""
+        while time.time() < end:
+            shown = driver.execute_script(
+                "var e=[...document.querySelectorAll('span.dijitSelect.state')]"
+                ".filter(function(x){return x.offsetParent;})[0];"
+                "return e ? (e.textContent || '') : '';") or ""
+            if state_name.lower() in shown.lower():
+                print(f"[INFO] State dropdown now shows: {state_name}")
+                break
+            time.sleep(0.5)
+        else:
+            debug_dump(driver, "state_not_set")
+            raise RuntimeError(
+                f"State dropdown still shows {shown.strip()!r} instead of '{state_name}' — "
+                "refusing to save an address with no state."
+            )
     else:
         print(f"[WARN] Unknown/blank state abbreviation '{state_ab}' for PO {po_number}. Please select state manually.")
 
