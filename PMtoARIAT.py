@@ -1380,6 +1380,35 @@ def enter_order_builder(driver, timeout=WAIT_LONG):
     )
 
 
+def click_login_button(driver, pwd_el, timeout=WAIT_LONG):
+    """
+    Clicks the Ariat login submit button without depending on its label.
+    The B2B login page is localized from the browser language (20+ languages),
+    so the English text "Login" is not guaranteed to exist (2026-10-14: three
+    runs on a TSG staff PC died here with NoSuchElement).  Try the stable
+    test id first, then any submit button in the form, then the text match,
+    and finally fall back to pressing ENTER in the password field.
+    """
+    attempts = [
+        ("button[data-testid='login-submit-btn']",
+         lambda: wait_and_click(driver, By.CSS_SELECTOR, "button[data-testid='login-submit-btn']", timeout=timeout)),
+        ("form button[type='submit']",
+         lambda: wait_and_click(driver, By.CSS_SELECTOR, "form button[type='submit']", timeout=WAIT_SHORT)),
+        ("button text 'Login'",
+         lambda: click_button_by_text(driver, "Login", timeout=WAIT_SHORT)),
+    ]
+    for label, attempt in attempts:
+        try:
+            el = attempt()
+            print(f"[INFO] Login button clicked via {label}.")
+            return el
+        except TimeoutException:
+            print(f"[INFO] Login button not found via {label}; trying next selector.")
+    print("[INFO] Login button not found by any selector; sending ENTER to the password field.")
+    pwd_el.send_keys(Keys.ENTER)
+    return None
+
+
 def login_and_land(driver):
     wait = WebDriverWait(driver, WAIT_LONG)
     driver.get(ARIAT_URL)
@@ -1393,7 +1422,7 @@ def login_and_land(driver):
     pwd.clear()
     pwd.send_keys(ARIAT_PASSWORD)
 
-    click_button_by_text(driver, "Login", timeout=WAIT_LONG)
+    click_login_button(driver, pwd, timeout=WAIT_LONG)
 
     # Drive the post-login  marketing -> catalog -> Dojo order-builder  transition
     # robustly.  (This hop was the historical cause of the intermittent failures:

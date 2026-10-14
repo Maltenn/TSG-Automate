@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "updated": "2026-09-03",
+  "updated": "2026-10-14",
   "files": [
     {
       "name": "tsg_automate_app.py",
@@ -45,7 +45,7 @@
     {
       "name": "PMtoARIAT.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoARIAT.py",
-      "sha256": "6854d9c811f36825278c5053de550a80e73fd08a413dbcf9787c5020a02e51b9"
+      "sha256": "bed98efb9e96ba5e57834eaa3ca5dc690a44e7add29fda1aac60075291bb5cb3"
     },
     {
       "name": "PMtoPropper.py",
