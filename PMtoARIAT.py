@@ -393,11 +393,33 @@ def wait_ready(driver, timeout=WAIT_MED):
     WebDriverWait(driver, timeout).until(lambda d: d.execute_script("return document.readyState") == "complete")
 
 
+# Re-entrancy guard: handle_availability_cancel_date_popup() clicks Save via
+# safe_click(); without this flag a blocked Save would call the handler again.
+_IN_AVAIL_MODAL_HANDLER = False
+
+
 def safe_click(driver, el):
+    """Click el; if an overlay blocks it, first resolve the one overlay that
+    blocks checkout in practice — the late 'Product Availability Issue'
+    cancel-date modal (back-orders, 2026-10-16) — and retry the real click.
+    Only then fall back to a JS click (which bypasses the overlay but leaves
+    the modal open to break the NEXT step)."""
     try:
         el.click()
+        return
     except (ElementClickInterceptedException, ElementNotInteractableException):
-        driver.execute_script("arguments[0].click();", el)
+        pass
+    if not _IN_AVAIL_MODAL_HANDLER:
+        try:
+            if handle_availability_cancel_date_popup(driver, timeout=0.5):
+                try:
+                    el.click()
+                    return
+                except (ElementClickInterceptedException, ElementNotInteractableException):
+                    pass
+        except Exception as e:
+            print(f"[WARN] Could not resolve a blocking modal before retrying the click: {_short_err(e)}")
+    driver.execute_script("arguments[0].click();", el)
 
 
 def wait_and_click(driver, by, sel, timeout=WAIT_MED):
@@ -1588,9 +1610,10 @@ def handle_availability_cancel_date_popup(driver, timeout=WAIT_SHORT) -> bool:
     Radio values are ISO dates ('2026-12-14'), grouped per shipment via the
     radio name ('Shipment 1', ...), so a lexicographic max is the latest date.
     Returns True if a modal was handled."""
+    global _IN_AVAIL_MODAL_HANDLER
     end = time.time() + timeout
     modal = None
-    while time.time() < end:
+    while True:   # check at least once, so timeout=0 is a cheap "is it up now?"
         for m in driver.find_elements(By.XPATH, _AVAIL_MODAL_XPATH):
             try:
                 if m.is_displayed():
@@ -1598,12 +1621,21 @@ def handle_availability_cancel_date_popup(driver, timeout=WAIT_SHORT) -> bool:
                     break
             except Exception:
                 continue
-        if modal is not None:
+        if modal is not None or time.time() >= end:
             break
         time.sleep(0.3)
     if modal is None:
         return False
+    if _IN_AVAIL_MODAL_HANDLER:
+        return False   # already being handled higher up the stack
+    _IN_AVAIL_MODAL_HANDLER = True
+    try:
+        return _resolve_availability_cancel_date_popup(driver, modal)
+    finally:
+        _IN_AVAIL_MODAL_HANDLER = False
 
+
+def _resolve_availability_cancel_date_popup(driver, modal) -> bool:
     print("[INFO] 'Product Availability Issue' popup detected — selecting the further-out cancel date(s).")
     picked = driver.execute_script("""
         var modal = arguments[0];
@@ -1915,6 +1947,12 @@ def fill_drop_ship_address(driver, po_number: str, addr: dict = None):
         if _any_displayed(driver, By.CSS_SELECTOR, CONFIRM_CSS):
             handle_address_confirmation_popup(driver, timeout=WAIT_MED)
             break
+        # (d) back-orders: changing the ship-to makes Ariat recompute
+        #     availability, and the cancel-date modal can land right here on
+        #     top of the address form (TSG PC, 2026-10-16).  Resolve and keep
+        #     polling for (a)/(b)/(c).
+        if handle_availability_cancel_date_popup(driver, timeout=0):
+            continue
         # (c) form closed with no modal pending → done
         if not _any_displayed(driver, By.CSS_SELECTOR, "input[name='address1']"):
             print("[INFO] Address form closed (no confirmation popup needed).")
@@ -2239,8 +2277,12 @@ def main():
 
                 addr = fill_drop_ship_address(driver, po_number, addr=addr)
                 print(f"[INFO] Address loaded from: {addr['csv_path']}")
+                # The ship-to change can trigger the cancel-date modal a beat
+                # later than the address flow sees it.
+                handle_availability_cancel_date_popup(driver, timeout=1)
 
                 fill_po_number_field(driver, po_number)
+                handle_availability_cancel_date_popup(driver, timeout=1)
 
                 # Verify AGAIN on the checkout page before asking for review —
                 # the badge stays visible there, so a mismatch is caught even
