@@ -32,6 +32,7 @@ from selenium.common.exceptions import (
     TimeoutException,
     ElementClickInterceptedException,
     ElementNotInteractableException,
+    StaleElementReferenceException,
 )
 from selenium.webdriver.common.action_chains import ActionChains
 
@@ -45,8 +46,15 @@ PDF_DIR = os.getenv("TSG_PDF_DIR", os.path.join(SCRIPT_DIR, "pdfs"))
 
 ARIAT_URL       = "https://b2b.ariat.com/"
 
-ARIAT_USERNAME  = os.getenv("ARIAT_USERNAME", "internal3")
-ARIAT_PASSWORD  = os.getenv("ARIAT_PASSWORD", "5Wft87ptvX68h3h")
+# Credentials come from the TSG app profile via the environment.  They are
+# stripped because a trailing newline in a stored password makes send_keys()
+# press ENTER, which submits the login form before the script looks for the
+# Login button (2026-10-16: this is what the TSG staff PC was doing — every
+# run landed on the logged-in home page and then died hunting for a button).
+_RAW_ARIAT_USERNAME = os.getenv("ARIAT_USERNAME", "internal3")
+_RAW_ARIAT_PASSWORD = os.getenv("ARIAT_PASSWORD", "5Wft87ptvX68h3h")
+ARIAT_USERNAME  = _RAW_ARIAT_USERNAME.strip()
+ARIAT_PASSWORD  = _RAW_ARIAT_PASSWORD.strip()
 
 WAIT_LONG  = 90
 WAIT_MED   = 30
@@ -1380,37 +1388,80 @@ def enter_order_builder(driver, timeout=WAIT_LONG):
     )
 
 
+def _warn_credential_whitespace():
+    """Tell the operator (without echoing secrets) when the profile's Ariat
+    credentials carried leading/trailing whitespace or a newline."""
+    for name, raw, clean in (("ARIAT_USERNAME", _RAW_ARIAT_USERNAME, ARIAT_USERNAME),
+                             ("ARIAT_PASSWORD", _RAW_ARIAT_PASSWORD, ARIAT_PASSWORD)):
+        if raw != clean:
+            kind = "a newline" if ("\n" in raw or "\r" in raw) else "whitespace"
+            print(f"[WARN] {name} from the profile had leading/trailing {kind}; it was "
+                  f"stripped before typing. Fix the value in Manage Profiles.")
+
+
+def _login_form_present(driver) -> bool:
+    """True while the Ariat login form (password input) is on screen."""
+    try:
+        return any(e.is_displayed()
+                   for e in driver.find_elements(By.CSS_SELECTOR, "input[name='password']"))
+    except Exception:
+        return False
+
+
+_LOGIN_TEXT_XPATH = ("//button[normalize-space()='Login' or .//div[normalize-space()='Login']"
+                     " or contains(normalize-space(.), 'Login')]")
+
+
 def click_login_button(driver, pwd_el, timeout=WAIT_LONG):
     """
-    Clicks the Ariat login submit button without depending on its label.
-    The B2B login page is localized from the browser language (20+ languages),
-    so the English text "Login" is not guaranteed to exist (2026-10-14: three
-    runs on a TSG staff PC died here with NoSuchElement).  Try the stable
-    test id first, then any submit button in the form, then the text match,
-    and finally fall back to pressing ENTER in the password field.
+    Submit the Ariat login form without depending on the button's label.
+
+    Polls for up to `timeout` seconds.  On every pass it first checks whether
+    the login form is still on screen — if it has already gone (the form was
+    submitted some other way, e.g. an ENTER produced by the typed password, or
+    the credentials check is complete), that IS success and we return.  While
+    the form is present it tries, in order, the stable test id, any submit
+    button in the form, and the English text match; the button is disabled
+    while the site shows "Checking Credentials...", so a disabled button just
+    means wait.  Only if nothing was clickable for the whole window does it
+    fall back to pressing ENTER in the password field.
     """
-    attempts = [
-        ("button[data-testid='login-submit-btn']",
-         lambda: wait_and_click(driver, By.CSS_SELECTOR, "button[data-testid='login-submit-btn']", timeout=timeout)),
-        ("form button[type='submit']",
-         lambda: wait_and_click(driver, By.CSS_SELECTOR, "form button[type='submit']", timeout=WAIT_SHORT)),
-        ("button text 'Login'",
-         lambda: click_button_by_text(driver, "Login", timeout=WAIT_SHORT)),
+    selectors = [
+        ("button[data-testid='login-submit-btn']", By.CSS_SELECTOR, "button[data-testid='login-submit-btn']"),
+        ("form button[type='submit']",             By.CSS_SELECTOR, "form button[type='submit']"),
+        ("button text 'Login'",                    By.XPATH,        _LOGIN_TEXT_XPATH),
     ]
-    for label, attempt in attempts:
-        try:
-            el = attempt()
-            print(f"[INFO] Login button clicked via {label}.")
-            return el
-        except TimeoutException:
-            print(f"[INFO] Login button not found via {label}; trying next selector.")
-    print("[INFO] Login button not found by any selector; sending ENTER to the password field.")
-    pwd_el.send_keys(Keys.ENTER)
+    end = time.time() + timeout
+    while time.time() < end:
+        if not _login_form_present(driver):
+            print("[INFO] Login form already gone after typing credentials — login was submitted without a click.")
+            return None
+        for label, by, sel in selectors:
+            for el in driver.find_elements(by, sel):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                        safe_click(driver, el)
+                        print(f"[INFO] Login button clicked via {label}.")
+                        return el
+                except StaleElementReferenceException:
+                    continue
+        time.sleep(0.5)
+
+    print("[WARN] Login button not found by any selector; sending ENTER to the password field.")
+    try:
+        pwd_el.send_keys(Keys.ENTER)
+    except StaleElementReferenceException:
+        if not _login_form_present(driver):
+            print("[INFO] Login form is gone — treating login as submitted.")
+            return None
+        driver.find_element(By.NAME, "password").send_keys(Keys.ENTER)
     return None
 
 
 def login_and_land(driver):
     wait = WebDriverWait(driver, WAIT_LONG)
+    _warn_credential_whitespace()
     driver.get(ARIAT_URL)
     wait_ready(driver)
 
