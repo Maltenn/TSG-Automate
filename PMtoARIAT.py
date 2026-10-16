@@ -1679,6 +1679,93 @@ def _resolve_availability_cancel_date_popup(driver, modal) -> bool:
     return True
 
 
+# ─── SHIPPING ADDRESS (checkout) ─────────────────────────────────────────────
+# Ariat's checkout shows the 'Drop Ship' controls only once a Shipping Address
+# is selected (client config dropShip.alwaysEnabled = false).  The internal3
+# login always arrived with its default ship-to pre-selected, so the script
+# never had to pick one; Erin's login (TSG PC, 2026-10-16) lands on
+# 'select...' and the Drop Ship button stays hidden — the run then timed out
+# waiting for it.  The drop-ship address entered afterwards overrides the
+# shipment destination, but the business wants the Broberry Manufacturing
+# entry as the base on every account.  Erin's account lists three:
+#   Precision Marketing & Sales Inc. (2000010702), Broberry DECO (2000016054),
+#   Broberry Manufacturing Inc. (20005756, 130 Howard Ln, Fayetteville GA)
+# so a loose 'broberry' match would land on DECO — match Manufacturing (or its
+# account number) and, if neither is listed, do NOT guess: fall through to the
+# operator hand-off below.
+_SHIP_DD_CSS = "[data-testid='checkout-shipping-address-dropdown']"
+_PREFERRED_SHIP_TO_KEYS = ("broberry manufacturing", "20005756")
+
+
+def _shipping_address_unselected(driver) -> bool:
+    """True when the checkout's Shipping Address dropdown is visible and still
+    showing its placeholder (no ship-to chosen)."""
+    try:
+        for dd in driver.find_elements(By.CSS_SELECTOR, _SHIP_DD_CSS):
+            if dd.is_displayed() and dd.find_elements(By.CSS_SELECTOR, "[class*='placeholder']"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _select_shipping_address(driver, prefer_keys=_PREFERRED_SHIP_TO_KEYS) -> bool:
+    """Open the Shipping Address react-select and pick the entry whose text
+    contains one of `prefer_keys` (checked in order, case-insensitive).  If
+    none matches, close the menu and return False — never pick an arbitrary
+    ship-to.  Returns True if an option was clicked."""
+    dds = [d for d in driver.find_elements(By.CSS_SELECTOR, _SHIP_DD_CSS) if d.is_displayed()]
+    if not dds:
+        return False
+    dd = dds[0]
+    ctrl = dd.find_element(By.CSS_SELECTOR, "[class*='-control']")
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", ctrl)
+    safe_click(driver, ctrl)
+
+    # react-select renders its menu (possibly in a portal) with role=option rows
+    end = time.time() + 6
+    opts = []
+    while time.time() < end:
+        seen, opts = set(), []
+        for o in driver.find_elements(By.CSS_SELECTOR, "[role='option'], [id^='react-select-'][id*='-option-']"):
+            try:
+                if o.is_displayed() and o.id not in seen:
+                    seen.add(o.id)
+                    opts.append(o)
+            except Exception:
+                continue
+        if opts:
+            break
+        time.sleep(0.25)
+    if not opts:
+        print("[WARN] Shipping Address dropdown opened but listed no options.")
+        try:
+            dd.find_element(By.CSS_SELECTOR, "input").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        return False
+
+    texts = [" ".join((o.text or "").split()) for o in opts]
+    print(f"[INFO] Shipping Address options ({len(opts)}): {texts[:8]}")
+    pick = None
+    for key in prefer_keys:
+        pick = next((o for o, t in zip(opts, texts) if key in t.lower()), None)
+        if pick is not None:
+            break
+    if pick is None:
+        print("[WARN] No 'Broberry Manufacturing' entry in the Shipping Address list — "
+              "not guessing; the operator will be asked to pick one.")
+        try:
+            dd.find_element(By.CSS_SELECTOR, "input").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        return False
+    print(f"[INFO] Selecting Shipping Address: {' '.join((pick.text or '').split())!r}")
+    safe_click(driver, pick)
+    time.sleep(1.0)
+    return True
+
+
 def proceed_to_checkout_flow(driver):
     # Step 1: 'Proceed to Checkout' on the order page (Dojo proceedBtn) -> cart.
     try:
@@ -1712,6 +1799,7 @@ def proceed_to_checkout_flow(driver):
     # shipping step.  Loop because the exact ordering varies: keep dismissing the
     # modal / re-clicking Proceed until the drop-ship button is present.
     end = time.time() + WAIT_LONG
+    address_attempts = 0
     while time.time() < end:
         if _any_displayed(driver, By.CSS_SELECTOR, "span.btnDropShip"):
             # Back-orders: the cancel-date modal can arrive with the checkout
@@ -1721,12 +1809,40 @@ def proceed_to_checkout_flow(driver):
             return
         if _sales_programs_modal_present(driver):
             _dismiss_sales_programs_modal(driver, timeout=WAIT_SHORT)
+        elif handle_availability_cancel_date_popup(driver, timeout=0):
+            pass   # resolved; loop back and look for the Drop Ship button again
+        elif _shipping_address_unselected(driver) and address_attempts < 2:
+            # Checkout reached, but no ship-to selected: the Drop Ship button
+            # stays hidden until one is (see _select_shipping_address).
+            address_attempts += 1
+            print("[INFO] Checkout reached with no Shipping Address selected — "
+                  "the Drop Ship button stays hidden until one is. Selecting Broberry Manufacturing...")
+            if not _select_shipping_address(driver):
+                address_attempts = 2   # no usable entry: go straight to the hand-off
+                break
         else:
             try:
                 click_button_by_text(driver, "Proceed to Checkout", timeout=3)
             except TimeoutException:
                 pass
         time.sleep(1.0)
+
+    # Still no Drop Ship button: let the operator fix the page instead of
+    # killing the run (the usual cause is the Shipping Address dropdown).
+    print("")
+    print("[ACTION REQUIRED]")
+    print("The 'Drop Ship' button is not showing on the Ariat checkout page.")
+    print("In the browser, pick an entry in the 'Shipping Address' dropdown so the")
+    print("'Drop Ship' button appears, then click 'Verification Complete' in the TSG app")
+    print("(running standalone: press Enter).")
+    wait_for_submit_enter()
+    end = time.time() + 20
+    while time.time() < end:
+        if _any_displayed(driver, By.CSS_SELECTOR, "span.btnDropShip"):
+            print("[INFO] Drop Ship button is now visible — continuing.")
+            handle_availability_cancel_date_popup(driver, timeout=3)
+            return
+        time.sleep(0.5)
 
     raise TimeoutException(
         "span.btnDropShip never appeared after Proceed-to-Checkout / Sales-Programs handling. "
