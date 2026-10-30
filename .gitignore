@@ -1,0 +1,24 @@
+# Credentials and per-machine settings — NEVER commit these.
+# profiles.json holds the Broberry admin, Wrangler, Ariat and Propper logins
+# that tsg_automate_app injects into the scripts as environment variables.
+profiles.json
+.env
+*.env
+
+# Per-machine working state (each install builds its own).
+# placed_orders.json in particular must stay local: it is the "already placed"
+# ledger, so shipping someone else's copy makes a fresh install silently SKIP
+# those POs.
+placed_orders.json
+skipped_orders.xlsx
+pdfs/
+
+# Debug artefacts — debug_dump() writes these next to the scripts.
+debug_*.png
+debug_*.html
+
+# Local-only folders
+Backup Scripts/
+chrome-win64/
+__pycache__/
+*.pyc

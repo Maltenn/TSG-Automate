@@ -21,13 +21,33 @@ EXCEL_PATH        = os.path.join(SCRIPT_DIR, 'Processed_orders.xlsx')
 
 LOGIN_URL            = "https://wranglerb2b.com/login.php/client/NQ=="
 ORDER_HISTORY_URL    = "https://wranglerb2b.com/tp_order_history.php/ecat_view"
+# Credentials come from the tsg_automate_app profile (env vars).  NEVER put a
+# real value here: this repo is PUBLIC and anything committed stays in history.
 
-EMAIL     = os.getenv("WRANGLER_EMAIL") or os.getenv("WRG_EMAIL") or "internal3@broberry.com"
-PASSWORD  = os.getenv("WRANGLER_PASSWORD") or os.getenv("WRG_PASSWORD") or "Internal3Broberry!"
+EMAIL     = os.getenv("WRANGLER_EMAIL") or os.getenv("WRG_EMAIL") or ""
+PASSWORD  = os.getenv("WRANGLER_PASSWORD") or os.getenv("WRG_PASSWORD") or ""
+
+
+def require_credentials():
+    """Fail with an actionable message instead of driving a login form blank.
+
+    Credentials are deliberately NOT stored in this file: the repo this script
+    ships from is public, and anything committed to it stays in git history.
+    They come from the tsg_automate_app profile, which injects them as env vars.
+    """
+    if EMAIL and PASSWORD:
+        return
+    raise SystemExit(
+        "[ACTION REQUIRED] No Wrangler credentials available.\n"
+        "  Open the TSG Automate app, select your profile, fill in the\n"
+        "  Wrangler email + password fields, and launch this script from the app.\n"
+        "  (Equivalently, set WRANGLER_EMAIL / WRANGLER_PASSWORD in the environment.)"
+    )
 # ────────────────────────────────────────────────────────────────────────────────
 
 def login(driver):
     """Log into Wrangler B2B with CAPTCHA pause."""
+    require_credentials()
     driver.get(LOGIN_URL)
     wait = WebDriverWait(driver, 20)
 

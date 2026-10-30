@@ -51,11 +51,30 @@ ARIAT_URL       = "https://b2b.ariat.com/"
 # press ENTER, which submits the login form before the script looks for the
 # Login button (2026-10-16: this is what the TSG staff PC was doing — every
 # run landed on the logged-in home page and then died hunting for a button).
-_RAW_ARIAT_USERNAME = os.getenv("ARIAT_USERNAME", "internal3")
-_RAW_ARIAT_PASSWORD = os.getenv("ARIAT_PASSWORD", "5Wft87ptvX68h3h")
+# Credentials come from the tsg_automate_app profile (env vars).  NEVER put a
+# real value here: this repo is PUBLIC and anything committed stays in history.
+_RAW_ARIAT_USERNAME = os.getenv("ARIAT_USERNAME", "")
+_RAW_ARIAT_PASSWORD = os.getenv("ARIAT_PASSWORD", "")
 ARIAT_USERNAME  = _RAW_ARIAT_USERNAME.strip()
 ARIAT_PASSWORD  = _RAW_ARIAT_PASSWORD.strip()
 
+
+
+def require_credentials():
+    """Fail with an actionable message instead of driving a login form blank.
+
+    Credentials are deliberately NOT stored in this file: the repo this script
+    ships from is public, and anything committed to it stays in git history.
+    They come from the tsg_automate_app profile, which injects them as env vars.
+    """
+    if ARIAT_USERNAME and ARIAT_PASSWORD:
+        return
+    raise SystemExit(
+        "[ACTION REQUIRED] No Ariat credentials available.\n"
+        "  Open the TSG Automate app, select your profile, fill in the\n"
+        "  Ariat username + password fields, and launch this script from the app.\n"
+        "  (Equivalently, set ARIAT_USERNAME / ARIAT_PASSWORD in the environment.)"
+    )
 WAIT_LONG  = 90
 WAIT_MED   = 30
 WAIT_SHORT = 10
@@ -1484,6 +1503,7 @@ def click_login_button(driver, pwd_el, timeout=WAIT_LONG):
 def login_and_land(driver):
     wait = WebDriverWait(driver, WAIT_LONG)
     _warn_credential_whitespace()
+    require_credentials()
     driver.get(ARIAT_URL)
     wait_ready(driver)
 

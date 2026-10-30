@@ -19,8 +19,27 @@ from openpyxl.styles import Font
 # Environment-driven settings (provided by the controller app)
 # --------------------------------------------------------------------
 INITIALS        = os.getenv("ORDER_USER_INITIALS", "MY")
-ADMIN_EMAIL     = os.getenv("BROBERRY_ADMIN_EMAIL", "internal3@broberry.com")
-ADMIN_PASSWORD  = os.getenv("BROBERRY_ADMIN_PASSWORD", "MYoung454$")
+# Credentials come from the tsg_automate_app profile (env vars).  NEVER put a
+# real value here: this repo is PUBLIC and anything committed stays in history.
+ADMIN_EMAIL     = os.getenv("BROBERRY_ADMIN_EMAIL", "")
+ADMIN_PASSWORD  = os.getenv("BROBERRY_ADMIN_PASSWORD", "")
+
+
+def require_credentials():
+    """Fail with an actionable message instead of driving a login form blank.
+
+    Credentials are deliberately NOT stored in this file: the repo this script
+    ships from is public, and anything committed to it stays in git history.
+    They come from the tsg_automate_app profile, which injects them as env vars.
+    """
+    if ADMIN_EMAIL and ADMIN_PASSWORD:
+        return
+    raise SystemExit(
+        "[ACTION REQUIRED] No Broberry admin credentials available.\n"
+        "  Open the TSG Automate app, select your profile, fill in the\n"
+        "  admin email + password fields, and launch this script from the app.\n"
+        "  (Equivalently, set BROBERRY_ADMIN_EMAIL / BROBERRY_ADMIN_PASSWORD in the environment.)"
+    )
 
 # Workspace and folders
 APP_DIR         = os.path.dirname(os.path.abspath(__file__))
@@ -367,6 +386,7 @@ def main():
     # Load any POs that BroberryShop.py marked as skipped so we don't crash on them
     skipped_pos = load_skipped_pos(SKIPPED_ORDERS_PATH)
 
+    require_credentials()
     driver = setup_driver(DOWNLOAD_FOLDER)
     try:
         login(driver, ADMIN_LOGIN_URL, ADMIN_EMAIL, ADMIN_PASSWORD)

@@ -25,12 +25,12 @@
     {
       "name": "BroberryShop_Backorders.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/BroberryShop_Backorders.py",
-      "sha256": "c8902dca4085719ca5bc162409e78c277869704d56d0d68fbcad5300da17027d"
+      "sha256": "ef367cfe5898c9e43bb4abdedd3ab708b44bbdff3f438d2673a4ff4da6c11709"
     },
     {
       "name": "ShoptoPM.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/ShoptoPM.py",
-      "sha256": "0336c066fa46a7a788454db0a192e74251705097d734f3b5649bf8f302073293"
+      "sha256": "1b12a1ce9e9364cae6b56569e0497b0ab50b5581bc30e1f5f78a0ff8a1b2bab7"
     },
     {
       "name": "Add_PM_Nums.py",
@@ -40,12 +40,12 @@
     {
       "name": "PMtoWRG.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoWRG.py",
-      "sha256": "c98a285e4523be6be28f1429ea591e215e9164b44c7a8b92c545a062a910ff95"
+      "sha256": "854ac526a5ba20f2f81b9888406edc94cb8664db2e65d35914d52df11e0e51ee"
     },
     {
       "name": "PMtoARIAT.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoARIAT.py",
-      "sha256": "7bb958eaa38d30fce3cad5c01ed98704e9d820d9651ca325f578ddd5c89164f0"
+      "sha256": "7e98b8c7d04cb74e4c6101b5586c1fc6b9bca66b149367722e501b7965653c93"
     },
     {
       "name": "PMtoPropper.py",
@@ -55,7 +55,7 @@
     {
       "name": "GetOrderId.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/GetOrderId.py",
-      "sha256": "fb2d439f89aafc187bccf2ba4c8c78e8c1807aa58f0f32a1242a8014e21fa307"
+      "sha256": "2b12e397cd9355a9503c5acdc0b163ae434d759a36e5c63e25a7705be0184ba0"
     },
     {
       "name": "tsg_runlog.py",
