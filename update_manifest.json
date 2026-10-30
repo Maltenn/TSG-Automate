@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "updated": "2026-10-16",
+  "updated": "2026-10-30",
   "files": [
     {
       "name": "tsg_automate_app.py",
@@ -40,7 +40,7 @@
     {
       "name": "PMtoWRG.py",
       "url": "https://raw.githubusercontent.com/Maltenn/TSG-Automate/main/PMtoWRG.py",
-      "sha256": "11b6fc762052c5acdee1352afe474f37e456663e435ceed77b9f6a1ad08a6447"
+      "sha256": "c98a285e4523be6be28f1429ea591e215e9164b44c7a8b92c545a062a910ff95"
     },
     {
       "name": "PMtoARIAT.py",

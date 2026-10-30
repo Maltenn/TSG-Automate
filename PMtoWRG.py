@@ -15,7 +15,8 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import (NoSuchElementException, TimeoutException,
+                                        StaleElementReferenceException)
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import Select
 
@@ -538,6 +539,250 @@ def to_text(x) -> str:
     return str(x).strip()
 
 
+# ─── SHIP-DATE CALENDAR (jQuery UI datepicker) ────────────────────────────────
+# Wrangler's "desired delivery date" field (input[name='desired_delivery_date'])
+# is a jQuery UI 1.14 datepicker configured minDate:1, maxDate:730,
+# numberOfMonths:1, showOtherMonths:false and beforeShowDay = weekdays only.
+# Two consequences the old one-line pick ignored:
+#   * the grid only ever holds days of the month currently on screen, and
+#   * only weekdays from tomorrow onward carry data-handler='selectDay' —
+#     every other cell renders as an empty, unclickable <td>.
+# So as soon as the next business day rolled into the following month the old
+#     //td[@data-handler='selectDay']/a[text()='{day}']
+# matched nothing, element_to_be_clickable timed out, and because that bubbles
+# out of create_new_draft the per-order handler re-raised and killed the run.
+# (Verified live on 30 Oct 2026: with minDate = Sat 31 Oct the October grid
+# contains ZERO selectable cells, so every order crashed.)
+# These helpers walk the calendar to the target month first and then match the
+# cell on its data-month/data-year, so the wrong month can never be clicked.
+
+_DP_MONTHS = ["january", "february", "march", "april", "may", "june", "july",
+              "august", "september", "october", "november", "december"]
+
+# Hard stop on the month walk.  maxDate is 730 days out, so 24 hops reaches any
+# date the site will accept; beyond that the calendar is misbehaving and we must
+# not spin forever.
+_DP_MAX_HOPS = 24
+
+
+def _dp_rendered(el):
+    """True if el is actually laid out on screen.
+
+    jQuery UI positions the calendar 'fixed' when its input sits inside a fixed
+    container (the fancybox popup does), so a non-zero box is kept as a second
+    signal rather than trusting is_displayed() alone.  A closed datepicker stays
+    in the DOM at display:none and measures 0, so this stays honest.
+    """
+    try:
+        if el.is_displayed():
+            return True
+        return bool(el.size.get("height"))
+    except StaleElementReferenceException:
+        return False
+
+
+def _dp_root(driver):
+    """The on-screen jQuery UI datepicker, or None if it is not open."""
+    for sel in ("#ui-datepicker-div", ".ui-datepicker-inline", ".ui-datepicker"):
+        for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            if _dp_rendered(el):
+                return el
+    return None
+
+
+def _dp_shown_month(driver):
+    """(year, month0) drawn in the datepicker header, or None if unreadable."""
+    root = _dp_root(driver)
+    if root is None:
+        return None
+
+    # changeMonth/changeYear style — unused by Wrangler today, but free to support.
+    try:
+        m_sel = root.find_element(By.CSS_SELECTOR, "select.ui-datepicker-month")
+        y_sel = root.find_element(By.CSS_SELECTOR, "select.ui-datepicker-year")
+        return int(y_sel.get_attribute("value")), int(m_sel.get_attribute("value"))
+    except (NoSuchElementException, StaleElementReferenceException, TypeError, ValueError):
+        pass
+
+    # Plain title style: "November 2026".
+    try:
+        m_txt = root.find_element(By.CSS_SELECTOR, ".ui-datepicker-month").text.strip().lower()
+        y_txt = root.find_element(By.CSS_SELECTOR, ".ui-datepicker-year").text.strip()
+        for i, name in enumerate(_DP_MONTHS):
+            if m_txt and name.startswith(m_txt):
+                return int(y_txt), i
+    except (NoSuchElementException, StaleElementReferenceException, ValueError):
+        pass
+
+    # Last resort: read it off any selectable cell.
+    for td in driver.find_elements(By.CSS_SELECTOR, "td[data-handler='selectDay']"):
+        try:
+            return int(td.get_attribute("data-year")), int(td.get_attribute("data-month"))
+        except (StaleElementReferenceException, TypeError, ValueError):
+            continue
+    return None
+
+
+def _dp_month_label(shown):
+    """'November 2026' from a (year, month0) tuple, for log lines."""
+    if not shown:
+        return "an unreadable month"
+    return f"{_DP_MONTHS[shown[1]].title()} {shown[0]}"
+
+
+def _dp_day_link(driver, d):
+    """The clickable <a> for date d, or None.
+
+    Matched on the cell's data-month (0-based) and data-year so a same-numbered
+    day belonging to another month can never be returned.
+    """
+    xp = (f"//td[@data-handler='selectDay' and @data-month='{d.month - 1}' "
+          f"and @data-year='{d.year}']/a[normalize-space(text())='{d.day}']")
+    for el in driver.find_elements(By.XPATH, xp):
+        if _dp_rendered(el):
+            return el
+    return None
+
+
+def _dp_hop(driver, forward=True):
+    """Step the calendar one month.  False if it would not / could not move."""
+    before = _dp_shown_month(driver)
+    cls = "ui-datepicker-next" if forward else "ui-datepicker-prev"
+    arrow = None
+    for a in driver.find_elements(By.CSS_SELECTOR, f"a.{cls}"):
+        if _dp_rendered(a):
+            arrow = a
+            break
+    if arrow is None:
+        return False
+    # At minDate/maxDate jQuery UI greys the arrow out and drops its data-handler.
+    if "ui-state-disabled" in (arrow.get_attribute("class") or ""):
+        log(f"[WARN] Calendar will not move past {_dp_month_label(before)} "
+            f"({'maxDate' if forward else 'minDate'} reached).")
+        return False
+    safe_click(driver, arrow)
+    try:
+        WebDriverWait(driver, 5).until(
+            lambda _d: _dp_shown_month(driver) not in (None, before)
+        )
+    except TimeoutException:
+        return False
+    return True
+
+
+def _dp_next_available(driver, not_before):
+    """Click the earliest selectable day on/after not_before.  Returns it, or None."""
+    for _ in range(_DP_MAX_HOPS):
+        best = None
+        for td in driver.find_elements(By.CSS_SELECTOR, "td[data-handler='selectDay']"):
+            try:
+                cand = datetime.date(int(td.get_attribute("data-year")),
+                                     int(td.get_attribute("data-month")) + 1,
+                                     int(td.text.strip()))
+            except (StaleElementReferenceException, TypeError, ValueError):
+                continue
+            if cand >= not_before and (best is None or cand < best[0]):
+                best = (cand, td)
+        if best is not None:
+            link = _dp_day_link(driver, best[0])
+            if link is not None:
+                safe_click(driver, link)
+                return best[0]
+        if not _dp_hop(driver, forward=True):
+            return None
+    return None
+
+
+def _dp_field_value(driver):
+    """Whatever the datepicker wrote into the desired-delivery-date input."""
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, "input[name='desired_delivery_date']")
+        return (el.get_attribute("value") or "").strip()
+    except (NoSuchElementException, StaleElementReferenceException):
+        return ""
+
+
+def _dp_verify(driver, expected):
+    """Fail loudly if the form did not receive the date we clicked."""
+    try:
+        WebDriverWait(driver, 5).until(lambda d: _dp_field_value(d))
+    except TimeoutException:
+        pass
+    raw = _dp_field_value(driver)
+    if not raw:
+        log("[WARN] Could not read the desired-delivery-date field back; "
+            "continuing on the clicked date.")
+        return
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
+        try:
+            got = datetime.datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+        if got != expected:
+            debug_dump(driver, "ship_date_mismatch")
+            raise RuntimeError(
+                f"Ship date mismatch: clicked {expected:%Y-%m-%d} but the draft "
+                f"form shows {raw!r}."
+            )
+        return
+    log(f"[WARN] Unrecognized ship-date format {raw!r} in the draft form; "
+        "continuing on the clicked date.")
+
+
+def select_ship_date(driver, ship_date, timeout=WAIT_SHORT):
+    """Pick ship_date in the draft popup's calendar, flipping months as needed.
+
+    Returns the date actually selected.  If the exact day is unavailable (a
+    holiday blackout, say) the next selectable day is taken and logged loudly —
+    a shifted ship date beats aborting the whole run.
+    """
+    try:
+        WebDriverWait(driver, timeout).until(lambda d: _dp_root(d) is not None)
+    except TimeoutException:
+        debug_dump(driver, "ship_date_no_calendar")
+        raise RuntimeError(
+            "The ship-date calendar never opened in the New Draft popup "
+            "(expected a jQuery UI datepicker after tabbing out of the name field)."
+        )
+
+    shown = _dp_shown_month(driver)
+    log(f"[INFO] Ship date wanted: {ship_date:%a %d %b %Y} "
+        f"(calendar opened on {_dp_month_label(shown)}).")
+
+    target = (ship_date.year, ship_date.month - 1)
+    picked = None
+
+    # 1) Walk to the target month, then click the exact day.
+    for _ in range(_DP_MAX_HOPS):
+        link = _dp_day_link(driver, ship_date)
+        if link is not None:
+            safe_click(driver, link)
+            picked = ship_date
+            break
+        shown = _dp_shown_month(driver)
+        if shown is None or shown == target:
+            break          # right month on screen, but that day is not selectable
+        if not _dp_hop(driver, forward=target > shown):
+            break
+
+    # 2) Exact day unavailable — take the next selectable one rather than abort.
+    if picked is None:
+        picked = _dp_next_available(driver, ship_date)
+        if picked is None:
+            debug_dump(driver, "ship_date_pick")
+            raise RuntimeError(
+                f"Could not select ship date {ship_date:%Y-%m-%d} in the draft "
+                f"calendar (stuck on {_dp_month_label(_dp_shown_month(driver))})."
+            )
+        log(f"[WARN] {ship_date:%a %d %b %Y} is not selectable in Wrangler's "
+            f"calendar — using the next available date {picked:%a %d %b %Y}.")
+
+    # 3) Confirm the form actually took it.
+    _dp_verify(driver, picked)
+    log(f"[OK] Ship date set to {picked:%a %d %b %Y}.")
+    return picked
+
+
 def create_new_draft(driver, draft_name, ship_date):
     wait = WebDriverWait(driver, 10)
     
@@ -555,10 +800,10 @@ def create_new_draft(driver, draft_name, ship_date):
         (By.ID, "pfm-newdraft"))
     ).send_keys(safe_name + "\t")
 
-    # Pick the ship date from the calendar
-    day = ship_date.day
-    xpath = f"//td[@data-handler='selectDay']/a[text()='{day}']"
-    wait.until(EC.element_to_be_clickable((By.XPATH, xpath))).click()
+    # Pick the ship date from the calendar.  Walks to the right month first —
+    # the next business day often lands in the FOLLOWING month (see the
+    # SHIP-DATE CALENDAR notes above).
+    select_ship_date(driver, ship_date)
 
     # Click "Save New Draft"
     driver.find_element(
